@@ -177,23 +177,44 @@ def answer_cb(callback_id, text=None):
 
 
 KB_MAIN = {
-    "keyboard": [[{"text": "ساخت پست"}], [{"text": "راهنما"}, {"text": "امضا زیر پیام"}]],
+    "keyboard": [
+        [{"text": "📝 ساخت پست"}],
+        [{"text": "📖 راهنما"}, {"text": "✍️ امضا زیر پیام"}],
+    ],
     "resize_keyboard": True,
 }
-KB_BACK = {"keyboard": [[{"text": "بازگشت"}]], "resize_keyboard": True}
+KB_BACK = {"keyboard": [[{"text": "🔙 بازگشت"}]], "resize_keyboard": True}
 KB_TYPE = {
-    "keyboard": [[{"text": "ساخت دکمه دستوری"}, {"text": "با دکمه"}], [{"text": "بازگشت"}]],
+    "keyboard": [
+        [{"text": "⌨️ ساخت دکمه دستوری"}, {"text": "➕ با دکمه"}],
+        [{"text": "🔙 بازگشت"}],
+    ],
     "resize_keyboard": True,
 }
-KB_DONE = {"keyboard": [[{"text": "تمام"}], [{"text": "بازگشت"}]], "resize_keyboard": True}
-KB_YESNO = {"keyboard": [[{"text": "بله"}, {"text": "خیر"}], [{"text": "بازگشت"}]], "resize_keyboard": True}
+KB_DONE = {"keyboard": [[{"text": "✅ تمام"}], [{"text": "🔙 بازگشت"}]], "resize_keyboard": True}
+KB_YESNO = {
+    "keyboard": [[{"text": "✅ بله"}, {"text": "❌ خیر"}], [{"text": "🔙 بازگشت"}]],
+    "resize_keyboard": True,
+}
+
+
+def norm_btn(text):
+    t = (text or "").strip()
+    for ch in "📝📖✍️🔙✅❌➕⌨️🔘📦🔗⚙️✨🌟💫🎉":
+        t = t.replace(ch, "")
+    return " ".join(t.split())
+
+
+def is_btn(text, *labels):
+    n = norm_btn(text)
+    return any(n == norm_btn(label) or n == label for label in labels)
 
 
 def kb_preview():
     return {
         "inline_keyboard": [[
-            {"text": "درست است", "callback_data": "pok"},
-            {"text": "نیاز به اصلاح دارد", "callback_data": "pedit"},
+            {"text": "✅ درست است", "callback_data": "pok"},
+            {"text": "✏️ نیاز به اصلاح دارد", "callback_data": "pedit"},
         ]]
     }
 
@@ -201,8 +222,8 @@ def kb_preview():
 def kb_send_method():
     return {
         "inline_keyboard": [
-            [{"text": "ارسال مستقیم در کانال", "callback_data": "sdir"}],
-            [{"text": "ارسال با دستور", "callback_data": "scmd"}],
+            [{"text": "📢 ارسال مستقیم در کانال", "callback_data": "sdir"}],
+            [{"text": "🔑 ارسال با دستور", "callback_data": "scmd"}],
         ]
     }
 
@@ -210,9 +231,9 @@ def kb_send_method():
 def kb_plans():
     return {
         "inline_keyboard": [
-            [{"text": "یک‌ماهه ۷ هزار", "callback_data": "sub1"}],
-            [{"text": "سه‌ماهه ۱۲ هزار", "callback_data": "sub3"}],
-            [{"text": "یک‌ساله ۸۰ هزار", "callback_data": "suby"}],
+            [{"text": "📅 یک‌ماهه — ۷ هزار", "callback_data": "sub1"}],
+            [{"text": "📆 سه‌ماهه — ۱۲ هزار", "callback_data": "sub3"}],
+            [{"text": "🏆 یک‌ساله — ۸۰ هزار", "callback_data": "suby"}],
         ]
     }
 
@@ -220,8 +241,8 @@ def kb_plans():
 def kb_sig_manage():
     return {
         "inline_keyboard": [
-            [{"text": "ویرایش متن امضا", "callback_data": "esig"}],
-            [{"text": "تغییر آیدی کانال", "callback_data": "echan"}],
+            [{"text": "✏️ ویرایش متن امضا", "callback_data": "esig"}],
+            [{"text": "📢 تغییر آیدی کانال", "callback_data": "echan"}],
         ]
     }
 
@@ -387,14 +408,14 @@ def save_sub_channel(user_id, chat, signature, can_edit, plan=None, expires=None
         )
 
 
-def go_main(chat_id, user_id, text="به منوی اصلی برگشتید."):
+def go_main(chat_id, user_id, text="🏠 برگشتید به منوی اصلی."):
     set_state(user_id, "idle", {})
     send(chat_id, text, KB_MAIN)
 
 
 HELP = (
-    "راهنمای ربات استار\n\n"
-    "ساخت پست:\n"
+    "✨ راهنمای ربات استار\n\n"
+    "📝 ساخت پست:\n"
     "۱. مطلب را بفرستید (متن، عکس، فیلم یا فایل).\n"
     "۲. ساخت دکمه دستوری: هر خط یک ردیف است. دکمه‌های یک ردیف را با && جدا کنید.\n"
     "مثال:\n"
@@ -403,15 +424,16 @@ HELP = (
     "نتیجه:\n"
     "دکمه | دکمه\n"
     "دکمه\n\n"
-    "با دکمه: زیر مطلب ➕ می‌آید. ➕ همان ردیف، دکمه را کنار قبلی می‌گذارد. "
+    "➕ با دکمه: زیر مطلب ➕ می‌آید. ➕ همان ردیف، دکمه را کنار قبلی می‌گذارد. "
     "➕ ردیف پایین، ردیف تازه می‌سازد. در پایان «تمام» را بزنید.\n\n"
     "بعد از تأیید، ربات را ادمین کانال کنید و آیدی کانال را بفرستید "
     "(@username یا عدد).\n"
-    "ارسال مستقیم همان لحظه در کانال منتشر می‌شود.\n"
-    "ارسال با دستور یک کد می‌دهد؛ هر کس در چتی که ربات عضو است "
+    "📢 ارسال مستقیم همان لحظه در کانال منتشر می‌شود.\n"
+    "🔑 ارسال با دستور یک کد می‌دهد؛ هر کس در چتی که ربات عضو است "
     "/start کد را بفرستد، همان پست ارسال می‌شود.\n\n"
-    "امضا زیر پیام: با اشتراک فعال، متن شما زیر پست‌های یک کانال چسبانده می‌شود. "
-    "فقط یک کانال قابل فعال‌سازی است."
+    "✍️ امضا زیر پیام: با اشتراک فعال، متن شما زیر پست‌های یک کانال چسبانده می‌شود. "
+    "فقط یک کانال قابل فعال‌سازی است.\n"
+    "⚠️ برای امضا، ربات باید ادمین کانال باشد و اجازهٔ ویرایش پیام داشته باشد."
 )
 
 
@@ -606,41 +628,70 @@ def ask_sig_channel(chat_id, user_id, data):
     send(chat_id, "آیدی تنها کانالی که امضا باید در آن فعال شود را بفرستید. @ یا عدد.", KB_BACK)
 
 
+def find_sig_sub(chat):
+    chat_id = str(chat.get("id") or "")
+    username = (chat.get("username") or "").lower()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM subs WHERE active=1 AND signature IS NOT NULL AND signature != ''"
+        ).fetchall()
+    for row in rows:
+        expires = datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None
+        if not expires or expires <= utcnow():
+            continue
+        stored = str(row["channel_id"] or "")
+        stored_user = (row["channel_username"] or "").lower()
+        if stored and stored == chat_id:
+            return row
+        if username and stored_user and stored_user == username:
+            return row
+        if stored and stored.lstrip("-") == chat_id.lstrip("-"):
+            return row
+    return None
+
+
 def apply_signature(post):
     chat = post.get("chat") or {}
-    chat_id = str(chat.get("id"))
     text = post.get("text")
     caption = post.get("caption")
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM subs WHERE active=1 AND channel_id=? AND can_edit=1 AND signature IS NOT NULL",
-            (chat_id,),
-        ).fetchone()
+    row = find_sig_sub(chat)
     if not row:
+        log.info("signature skip: no sub for chat %s", chat.get("id"))
         return
-    expires = datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None
-    if not expires or expires <= utcnow():
+    if not row["can_edit"]:
+        log.info("signature skip: can_edit=0 user=%s", row["user_id"])
         return
-    signature = row["signature"].strip()
+    signature = (row["signature"] or "").strip()
     if not signature:
         return
+    mid = post.get("message_id")
+    cid = chat.get("id")
     if text is not None:
-        if text.endswith(signature):
+        if signature in text:
             return
-        new_text = (text + "\n\n" + signature).strip()
-        api("editMessageText", chat_id=chat["id"], message_id=post["message_id"], text=new_text)
-    elif caption is not None or any(k in post for k in ("photo", "video", "animation", "document", "audio")):
+        new_text = (text.rstrip() + "\n\n" + signature).strip()
+        res = api("editMessageText", chat_id=cid, message_id=mid, text=new_text)
+        if not res.get("ok"):
+            log.warning("editMessageText failed chat=%s mid=%s: %s", cid, mid, res)
+        else:
+            log.info("signature applied to text chat=%s mid=%s", cid, mid)
+        return
+    if caption is not None or any(k in post for k in ("photo", "video", "animation", "document", "audio")):
         base = caption or ""
-        if base.endswith(signature):
+        if signature in base:
             return
-        new_caption = (base + "\n\n" + signature).strip()
-        api("editMessageCaption", chat_id=chat["id"], message_id=post["message_id"], caption=new_caption)
+        new_caption = (base.rstrip() + "\n\n" + signature).strip() if base else signature
+        res = api("editMessageCaption", chat_id=cid, message_id=mid, caption=new_caption)
+        if not res.get("ok"):
+            log.warning("editMessageCaption failed chat=%s mid=%s: %s", cid, mid, res)
+        else:
+            log.info("signature applied to caption chat=%s mid=%s", cid, mid)
 
 
 def on_text_flow(chat_id, user_id, text, message):
     state, data = get_state(user_id)
 
-    if text == "بازگشت":
+    if is_btn(text, "بازگشت"):
         if state in ("waiting_btn_text", "waiting_btn_url"):
             data.pop("temp_text", None)
             data.pop("add_mode", None)
@@ -650,22 +701,22 @@ def on_text_flow(chat_id, user_id, text, message):
         go_main(chat_id, user_id)
         return
 
-    if text == "ساخت پست":
+    if is_btn(text, "ساخت پست"):
         start_create(chat_id, user_id)
         return
-    if text == "راهنما":
+    if is_btn(text, "راهنما"):
         send(chat_id, HELP, KB_MAIN)
         return
-    if text == "امضا زیر پیام":
+    if is_btn(text, "امضا زیر پیام"):
         begin_signature(chat_id, user_id)
         return
-    if text == "ساخت دکمه دستوری" and state == "choose_type":
+    if is_btn(text, "ساخت دکمه دستوری") and state == "choose_type":
         begin_command(chat_id, user_id)
         return
-    if text == "با دکمه" and state == "choose_type":
+    if is_btn(text, "با دکمه") and state == "choose_type":
         begin_plus(chat_id, user_id)
         return
-    if text == "تمام" and state == "plus":
+    if is_btn(text, "تمام") and state == "plus":
         if not data.get("buttons"):
             send(chat_id, "حداقل یک دکمه اضافه کنید یا بازگشت را بزنید.")
             return
@@ -740,12 +791,15 @@ def on_text_flow(chat_id, user_id, text, message):
         return
 
     if state == "sig_edit":
-        if text not in ("بله", "خیر"):
-            send(chat_id, "فقط «بله» یا «خیر» را بفرستید.")
+        if is_btn(text, "بله"):
+            data["can_edit"] = True
+        elif is_btn(text, "خیر"):
+            data["can_edit"] = False
+        else:
+            send(chat_id, "فقط «بله» یا «خیر» را بفرستید.", KB_YESNO)
             return
-        data["can_edit"] = text == "بله"
         set_state(user_id, "sig_text", data)
-        send(chat_id, "متن امضا را بفرستید. این متن زیر پست‌های کانال چسبانده می‌شود.", KB_BACK)
+        send(chat_id, "✍️ متن امضا را بفرستید. این متن زیر پست‌های کانال چسبانده می‌شود.", KB_BACK)
         return
 
     if state == "sig_text":
@@ -758,18 +812,22 @@ def on_text_flow(chat_id, user_id, text, message):
                 "UPDATE subs SET channel_id=?, channel_username=?, signature=?, can_edit=? WHERE user_id=?",
                 (str(chat["id"]), chat.get("username"), text.strip(), 1 if data.get("can_edit") else 0, user_id),
             )
-        note = "" if data.get("can_edit") else "\nچون مجوز ویرایش ندارید، امضا خودکار اعمال نمی‌شود."
-        go_main(chat_id, user_id, "امضا برای همین یک کانال فعال شد." + note)
+        note = (
+            "\n✅ از این به بعد زیر پست‌های کانال چسبانده می‌شود."
+            if data.get("can_edit")
+            else "\n⚠️ چون مجوز ویرایش ندارید، امضا خودکار اعمال نمی‌شود."
+        )
+        go_main(chat_id, user_id, "✅ امضا برای همین یک کانال فعال شد." + note)
         return
 
     if state == "sig_text_only":
         with connect() as conn:
             conn.execute("UPDATE subs SET signature=? WHERE user_id=?", (text.strip(), user_id))
-        go_main(chat_id, user_id, "متن امضا به‌روز شد.")
+        go_main(chat_id, user_id, "✅ متن امضا به‌روز شد.")
         return
 
     if state == "idle":
-        send(chat_id, "از دکمه‌های پایین استفاده کنید.", KB_MAIN)
+        send(chat_id, "👇 از دکمه‌های پایین استفاده کنید.", KB_MAIN)
 
 
 def on_callback(cq):
@@ -823,9 +881,22 @@ def on_callback(cq):
 def on_message(message):
     if "from" not in message or message.get("from", {}).get("is_bot"):
         return
-    chat_id = message["chat"]["id"]
+    chat = message.get("chat") or {}
+    chat_id = chat["id"]
+    chat_type = chat.get("type") or ""
     user_id = message["from"]["id"]
     text = (message.get("text") or "").strip()
+
+    if text.startswith("/start"):
+        parts = text.split(maxsplit=1)
+        arg = parts[1].split()[0] if len(parts) > 1 else ""
+        arg = arg.split("@", 1)[0]
+        if arg and handle_start_code(chat_id, message["message_id"], arg):
+            return
+        if chat_type and chat_type != "private":
+            return
+        go_main(chat_id, user_id, "🌟 سلام! به ربات استار خوش آمدید.\n👇 از دکمه‌های پایین استفاده کنید.")
+        return
 
     if user_id == ADMIN_ID and text.startswith("برای "):
         match = re.search(r"برای\s+(\d+)\s+اشتراک\s+(\S+)\s+فعال\s*کن", text)
@@ -839,13 +910,8 @@ def on_message(message):
         activate_plan(chat_id, int(match.group(1)), plan)
         return
 
-    if text.startswith("/start"):
-        parts = text.split(maxsplit=1)
-        arg = parts[1].split()[0] if len(parts) > 1 else ""
-        arg = arg.split("@", 1)[0]
-        if arg and handle_start_code(chat_id, message["message_id"], arg):
-            return
-        go_main(chat_id, user_id, "سلام. ربات استار آماده است. از دکمه‌های پایین استفاده کنید.")
+    # منوی ربات فقط در چت خصوصی — در گروه/کانال اسپم نکند
+    if chat_type and chat_type != "private":
         return
 
     if text or message.get("caption") or extract_content(message):
@@ -873,11 +939,28 @@ def process(update):
         log.exception("update failed")
 
 
+def flush_pending_updates():
+    """آپدیت‌های معوق را بدون پردازش رد می‌کند تا بعد از دیپلوی اسپم نشود."""
+    offset = 0
+    for _ in range(10):
+        res = api("getUpdates", offset=offset, timeout=0)
+        if not res.get("ok"):
+            break
+        batch = res.get("result") or []
+        if not batch:
+            break
+        offset = batch[-1]["update_id"] + 1
+    if offset:
+        meta_set("offset", offset)
+        log.info("skipped pending updates, offset=%s", offset)
+    return offset
+
+
 def main():
     init_db()
     start_http()
     api("deleteWebhook")
-    offset = int(meta_get("offset", "0") or 0)
+    offset = flush_pending_updates() or int(meta_get("offset", "0") or 0)
     log.info("star bot polling, db=%s", DB_PATH)
     while True:
         try:
