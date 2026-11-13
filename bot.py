@@ -7,9 +7,11 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import requests
@@ -873,6 +875,7 @@ def process(update):
 
 def main():
     init_db()
+    start_http()
     api("deleteWebhook")
     offset = int(meta_get("offset", "0") or 0)
     log.info("star bot polling, db=%s", DB_PATH)
@@ -889,6 +892,27 @@ def main():
         except Exception:
             log.exception("poll loop")
             time.sleep(5)
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        return
+
+
+def start_http():
+    port = int(os.environ.get("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info("http listening on 0.0.0.0:%s", port)
 
 
 if __name__ == "__main__":
