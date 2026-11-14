@@ -628,9 +628,13 @@ def ask_sig_channel(chat_id, user_id, data):
     send(chat_id, "آیدی تنها کانالی که امضا باید در آن فعال شود را بفرستید. @ یا عدد.", KB_BACK)
 
 
+# جلوگیری از اعمال دوباره امضا روی همان پیام
+_SIG_DONE = set()
+
+
 def find_sig_sub(chat):
     chat_id = str(chat.get("id") or "")
-    username = (chat.get("username") or "").lower()
+    username = (chat.get("username") or "").lstrip("@").lower()
     with connect() as conn:
         rows = conn.execute(
             "SELECT * FROM subs WHERE active=1 AND signature IS NOT NULL AND signature != ''"
@@ -640,52 +644,104 @@ def find_sig_sub(chat):
         if not expires or expires <= utcnow():
             continue
         stored = str(row["channel_id"] or "")
-        stored_user = (row["channel_username"] or "").lower()
+        stored_user = (row["channel_username"] or "").lstrip("@").lower()
         if stored and stored == chat_id:
             return row
         if username and stored_user and stored_user == username:
             return row
-        if stored and stored.lstrip("-") == chat_id.lstrip("-"):
+        # تطبیق عددی بدون علامت منفی
+        if stored and stored.lstrip("-") == chat_id.lstrip("-") and stored.lstrip("-").isdigit():
+            return row
+        # اگر کاربر @username ذخیره کرده ولی channel_id عدد است
+        if username and stored and stored.lstrip("@").lower() == username:
             return row
     return None
 
 
+def _sig_reply(cid, mid, signature):
+    """اگر ویرایش ممکن نبود، امضا را به‌صورت ریپلای زیر پست می‌فرستد."""
+    return api(
+        "sendMessage",
+        chat_id=cid,
+        text=signature,
+        reply_to_message_id=mid,
+    )
+
+
 def apply_signature(post):
+    """امضا را زیر پست کانال می‌چسباند.
+
+    در API بله/تلگرام ربات معمولاً نمی‌تواند پیام ادمین را ویرایش کند؛
+    پس اول edit را امتحان می‌کنیم و اگر نشد، با reply_to امضا را می‌فرستیم.
+    """
     chat = post.get("chat") or {}
     text = post.get("text")
     caption = post.get("caption")
+    mid = post.get("message_id")
+    cid = chat.get("id")
+    if mid is None or cid is None:
+        return
+
+    key = f"{cid}:{mid}"
+    if key in _SIG_DONE:
+        return
+
+    # پیام خودِ ربات (امضای قبلی) را دوباره امضا نکن
+    from_user = post.get("from") or {}
+    if from_user.get("is_bot"):
+        return
+    # اگر خود متن قبلاً امضا بوده رد شو
+    signature_probe = (text or caption or "")
     row = find_sig_sub(chat)
     if not row:
-        log.info("signature skip: no sub for chat %s", chat.get("id"))
+        log.info(
+            "signature skip: no matching sub for chat_id=%s username=%s",
+            chat.get("id"),
+            chat.get("username"),
+        )
         return
-    if not row["can_edit"]:
-        log.info("signature skip: can_edit=0 user=%s", row["user_id"])
-        return
+
     signature = (row["signature"] or "").strip()
     if not signature:
         return
-    mid = post.get("message_id")
-    cid = chat.get("id")
-    if text is not None:
-        if signature in text:
-            return
-        new_text = (text.rstrip() + "\n\n" + signature).strip()
-        res = api("editMessageText", chat_id=cid, message_id=mid, text=new_text)
-        if not res.get("ok"):
-            log.warning("editMessageText failed chat=%s mid=%s: %s", cid, mid, res)
-        else:
-            log.info("signature applied to text chat=%s mid=%s", cid, mid)
+    if signature in signature_probe:
         return
-    if caption is not None or any(k in post for k in ("photo", "video", "animation", "document", "audio")):
-        base = caption or ""
-        if signature in base:
-            return
-        new_caption = (base.rstrip() + "\n\n" + signature).strip() if base else signature
-        res = api("editMessageCaption", chat_id=cid, message_id=mid, caption=new_caption)
-        if not res.get("ok"):
-            log.warning("editMessageCaption failed chat=%s mid=%s: %s", cid, mid, res)
-        else:
-            log.info("signature applied to caption chat=%s mid=%s", cid, mid)
+
+    edited = False
+    # تلاش برای ویرایش (فقط وقتی کاربر گفته مجوز ویرایش دارد)
+    if row["can_edit"]:
+        if text is not None:
+            new_text = (text.rstrip() + "\n\n" + signature).strip()
+            res = api("editMessageText", chat_id=cid, message_id=mid, text=new_text)
+            edited = bool(res.get("ok"))
+            if not edited:
+                log.warning("editMessageText failed chat=%s mid=%s: %s — fallback reply", cid, mid, res)
+        elif caption is not None or any(
+            k in post for k in ("photo", "video", "animation", "document", "audio")
+        ):
+            base = caption or ""
+            new_caption = (base.rstrip() + "\n\n" + signature).strip() if base else signature
+            res = api("editMessageCaption", chat_id=cid, message_id=mid, caption=new_caption)
+            edited = bool(res.get("ok"))
+            if not edited:
+                log.warning("editMessageCaption failed chat=%s mid=%s: %s — fallback reply", cid, mid, res)
+
+    if edited:
+        _SIG_DONE.add(key)
+        log.info("signature edited into post chat=%s mid=%s", cid, mid)
+        return
+
+    # روش مطمئن: ریپلای زیر پست
+    res = _sig_reply(cid, mid, signature)
+    if res.get("ok"):
+        _SIG_DONE.add(key)
+        log.info("signature replied under post chat=%s mid=%s", cid, mid)
+    else:
+        log.warning("signature reply failed chat=%s mid=%s: %s", cid, mid, res)
+
+    # جلوگیری از رشد بی‌نهایت حافظه
+    if len(_SIG_DONE) > 5000:
+        _SIG_DONE.clear()
 
 
 def on_text_flow(chat_id, user_id, text, message):
@@ -812,12 +868,23 @@ def on_text_flow(chat_id, user_id, text, message):
                 "UPDATE subs SET channel_id=?, channel_username=?, signature=?, can_edit=? WHERE user_id=?",
                 (str(chat["id"]), chat.get("username"), text.strip(), 1 if data.get("can_edit") else 0, user_id),
             )
-        note = (
-            "\n✅ از این به بعد زیر پست‌های کانال چسبانده می‌شود."
-            if data.get("can_edit")
-            else "\n⚠️ چون مجوز ویرایش ندارید، امضا خودکار اعمال نمی‌شود."
+        log.info(
+            "signature configured user=%s channel_id=%s username=%s can_edit=%s",
+            user_id,
+            chat.get("id"),
+            chat.get("username"),
+            bool(data.get("can_edit")),
         )
-        go_main(chat_id, user_id, "✅ امضا برای همین یک کانال فعال شد." + note)
+        note = (
+            "\n✅ ربات زیر هر پست جدید کانال، امضا را می‌چسباند "
+            "(اگر ویرایش ممکن نباشد به‌صورت ریپلای می‌فرستد)."
+        )
+        go_main(
+            chat_id,
+            user_id,
+            f"✅ امضا فعال شد.\nکانال: {chat.get('username') or chat.get('id')}\n"
+            f"آیدی ذخیره‌شده: {chat.get('id')}" + note,
+        )
         return
 
     if state == "sig_text_only":
@@ -910,6 +977,23 @@ def on_message(message):
         activate_plan(chat_id, int(match.group(1)), plan)
         return
 
+    if user_id == ADMIN_ID and text in ("/subs", "وضعیت اشتراک‌ها"):
+        with connect() as conn:
+            rows = conn.execute("SELECT * FROM subs ORDER BY user_id").fetchall()
+        if not rows:
+            send(chat_id, "هیچ اشتراکی در دیتابیس نیست.")
+            return
+        lines = []
+        for r in rows:
+            lines.append(
+                f"user={r['user_id']} active={r['active']} plan={r['plan']}\n"
+                f"exp={r['expires_at']}\n"
+                f"ch={r['channel_id']} @{r['channel_username'] or '-'}\n"
+                f"can_edit={r['can_edit']} sig={(r['signature'] or '')[:40]}"
+            )
+        send(chat_id, "\n\n".join(lines)[:3500])
+        return
+
     # منوی ربات فقط در چت خصوصی — در گروه/کانال اسپم نکند
     if chat_type and chat_type != "private":
         return
@@ -918,19 +1002,29 @@ def on_message(message):
         on_text_flow(chat_id, user_id, text, message)
 
 
+def handle_channel_content(post):
+    """پست کانال: کد /start یا امضا."""
+    text = (post.get("text") or "").strip()
+    if text.startswith("/start"):
+        parts = text.split(maxsplit=1)
+        arg = parts[1].split()[0] if len(parts) > 1 else ""
+        if arg and handle_start_code(post["chat"]["id"], post["message_id"], arg):
+            return
+    apply_signature(post)
+
+
 def process(update):
     try:
-        if "message" in update:
-            on_message(update["message"])
-        elif "channel_post" in update:
-            post = update["channel_post"]
-            text = (post.get("text") or "").strip()
-            if text.startswith("/start"):
-                parts = text.split(maxsplit=1)
-                arg = parts[1].split()[0] if len(parts) > 1 else ""
-                if arg and handle_start_code(post["chat"]["id"], post["message_id"], arg):
-                    return
-            apply_signature(post)
+        if "channel_post" in update:
+            handle_channel_content(update["channel_post"])
+        elif "message" in update:
+            msg = update["message"]
+            chat_type = (msg.get("chat") or {}).get("type") or ""
+            # بعضی سرورها پست کانال را به‌صورت message می‌فرستند
+            if chat_type == "channel":
+                handle_channel_content(msg)
+            else:
+                on_message(msg)
         elif "callback_query" in update:
             on_callback(update["callback_query"])
         elif "edited_channel_post" in update:
