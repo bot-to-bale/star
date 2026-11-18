@@ -180,7 +180,9 @@ class DB:
                 user_id BIGINT PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
-                started_at TEXT
+                started_at TEXT,
+                referred_by BIGINT,
+                ref_count INTEGER DEFAULT 0
             )""",
             """CREATE TABLE IF NOT EXISTS star_subs (
                 user_id BIGINT PRIMARY KEY,
@@ -218,7 +220,9 @@ class DB:
                     user_id BIGINT PRIMARY KEY,
                     username TEXT,
                     first_name TEXT,
-                    started_at TEXT
+                    started_at TEXT,
+                    referred_by BIGINT,
+                    ref_count INTEGER DEFAULT 0
                 )""",
                 """CREATE TABLE IF NOT EXISTS star_subs (
                     user_id BIGINT PRIMARY KEY,
@@ -254,7 +258,17 @@ class DB:
                 self.execute(s)
             except Exception as e:
                 log.warning("init table: %s", e)
-        log.info("db ready kind=%s", self.kind)
+        
+        # مهاجرت ستون‌های دعوت
+        for alter in [
+            "ALTER TABLE star_users ADD COLUMN referred_by BIGINT",
+            "ALTER TABLE star_users ADD COLUMN ref_count INTEGER DEFAULT 0",
+        ]:
+            try:
+                self.execute(alter)
+            except Exception:
+                pass
+log.info("db ready kind=%s", self.kind)
 
 
 db = DB()
@@ -323,11 +337,9 @@ def main_kb(is_admin=False):
     rows = [
         [{"text": "📝 ساخت پست"}],
         [{"text": "👤 حساب کاربری"}, {"text": "✍️ امضا زیر پیام"}],
-        [{"text": "🎫 تیکت و پشتیبانی"}, {"text": "🤖 ربات‌های دیگر ما"}],
-        [{"text": "📖 راهنما"}],
+        [{"text": "🎫 تیکت و پشتیبانی"}, {"text": "🔗 دعوت دوستان"}],
+        [{"text": "🤖 ربات‌های دیگر ما"}, {"text": "📖 راهنما"}],
     ]
-    if is_admin:
-        rows.append([{"text": "🛠 پنل ادمین"}])
     return {"keyboard": rows, "resize_keyboard": True}
 
 
@@ -344,7 +356,8 @@ def inline(rows):
 
 
 # ───────────────────────── کاربران و اشتراک ─────────────────────────
-def ensure_user(user):
+def ensure_user(user, referred_by=None):
+    """ثبت کاربر؛ True اگر کاربر کاملاً جدید باشد"""
     uid = user["id"]
     username = user.get("username") or ""
     first_name = user.get("first_name") or ""
@@ -352,14 +365,15 @@ def ensure_user(user):
     row = db.execute("SELECT user_id FROM star_users WHERE user_id=?", (uid,), fetch="one")
     if not row:
         db.execute(
-            "INSERT INTO star_users (user_id, username, first_name, started_at) VALUES (?,?,?,?)",
-            (uid, username, first_name, now),
+            "INSERT INTO star_users (user_id, username, first_name, started_at, referred_by, ref_count) VALUES (?,?,?,?,?,?)",
+            (uid, username, first_name, now, referred_by, 0),
         )
-    else:
-        db.execute(
-            "UPDATE star_users SET username=?, first_name=? WHERE user_id=?",
-            (username, first_name, uid),
-        )
+        return True
+    db.execute(
+        "UPDATE star_users SET username=?, first_name=? WHERE user_id=?",
+        (username, first_name, uid),
+    )
+    return False
 
 
 def get_sub(uid):
@@ -377,21 +391,61 @@ def is_sub_active(uid):
         return False
 
 
-def activate_sub(uid, plan):
-    days = {"1m": 30, "3m": 90, "1y": 365}.get(plan, 30)
-    exp = (datetime.utcnow() + timedelta(days=days)).isoformat()
+def add_sub_days(uid, days, plan_label=None):
+    """اضافه کردن روز به اشتراک (جمع با باقیمانده)"""
+    now = datetime.utcnow()
     row = get_sub(uid)
+    base = now
+    channel_id = signature_text = None
+    can_edit = 0
+    if row:
+        channel_id = row.get("channel_id")
+        signature_text = row.get("signature_text")
+        can_edit = row.get("can_edit") or 0
+        if row.get("expires_at"):
+            try:
+                exp = datetime.fromisoformat(str(row["expires_at"]).replace("Z", ""))
+                if exp > now:
+                    base = exp
+            except Exception:
+                pass
+    new_exp = base + timedelta(days=int(days))
+    exp_s = new_exp.isoformat()
+    plan = plan_label or (row.get("plan") if row else "gift")
     if row:
         db.execute(
             "UPDATE star_subs SET plan=?, expires_at=? WHERE user_id=?",
-            (plan, exp, uid),
+            (plan, exp_s, uid),
         )
     else:
         db.execute(
             "INSERT INTO star_subs (user_id, plan, expires_at, channel_id, signature_text, can_edit) VALUES (?,?,?,?,?,?)",
-            (uid, plan, exp, None, None, 0),
+            (uid, plan, exp_s, channel_id, signature_text, can_edit),
         )
-    return exp
+    return exp_s
+
+
+def activate_sub(uid, plan):
+    days = {"1m": 30, "3m": 90, "1y": 365}.get(plan, 30)
+    return add_sub_days(uid, days, plan_label=plan)
+
+
+def apply_referral_reward(referrer_id):
+    """referral reward"""
+    row = db.execute("SELECT ref_count FROM star_users WHERE user_id=?", (referrer_id,), fetch="one")
+    count = int((row or {}).get("ref_count") or 0) + 1
+    db.execute("UPDATE star_users SET ref_count=? WHERE user_id=?", (count, referrer_id))
+    send_message(referrer_id, "✅ دعوت موفق بود!\nتعداد دعوت‌های موفق شما: *%d*" % count)
+    if count % 3 == 0:
+        months = min(count // 3, 12)
+        exp = add_sub_days(referrer_id, months * 30, plan_label="ref%dm" % months)
+        send_message(
+            referrer_id,
+            "🎁 با %d دعوت موفق، *%d ماه* اشتراک برای شما فعال/تمدید شد.\nتاریخ اتمام (شمسی): %s"
+            % (count, months, to_jalali(datetime.fromisoformat(exp))),
+        )
+    return count
+
 
 
 def revoke_sub(uid):
@@ -499,35 +553,56 @@ def format_preview(content, buttons):
 
 # ───────────────────────── هندلرها ─────────────────────────
 def handle_start(chat_id, user, text):
-    ensure_user(user)
     uid = user["id"]
-    # /start CODE
     parts = (text or "").split(maxsplit=1)
-    if len(parts) == 2:
-        code = parts[1].strip()
-        row = db.execute(
-            "SELECT * FROM star_codes WHERE code=?", (code,), fetch="one"
-        )
+    arg = parts[1].strip() if len(parts) == 2 else ""
+
+    if arg.lower() == "restart":
+        clear_state(uid)
+        ensure_user(user)
+        send_message(chat_id, "به منوی اصلی برگشتید.", reply_markup=main_kb())
+        return
+
+    if arg and not arg.startswith("ref_"):
+        row = db.execute("SELECT * FROM star_codes WHERE code=?", (arg,), fetch="one")
         if row:
             try:
+                ensure_user(user)
                 payload = json.loads(row["payload"])
                 send_post_payload(chat_id, payload)
-                # سعی در حذف پیام دستور
                 return
             except Exception as e:
                 log.warning("code post: %s", e)
-    send_message(
-        chat_id,
-        "🌟 سلام! به ربات **استار** خوش آمدید.\n\n"
+
+    referred_by = None
+    if arg.startswith("ref_"):
+        try:
+            referred_by = int(arg[4:].strip())
+            if referred_by == uid:
+                referred_by = None
+        except Exception:
+            referred_by = None
+
+    is_new = ensure_user(user, referred_by=referred_by)
+    if is_new and referred_by:
+        ref_row = db.execute("SELECT user_id FROM star_users WHERE user_id=?", (referred_by,), fetch="one")
+        if ref_row:
+            apply_referral_reward(referred_by)
+
+    welcome = (
+        "🌟 سلام! به ربات *استار* خوش آمدید.\n\n"
         "با من می‌تونی:\n"
         "📝 پست با دکمه شیشه‌ای بسازی\n"
         "📢 مستقیم یا با دستور به کانال بفرستی\n"
         "✍️ امضا زیر پست‌های کانالت بذاری\n"
-        "🎫 تیکت و پشتیبانی بگیری\n\n"
-        "👇 از دکمه‌های پایین شروع کن.",
-        reply_markup=main_kb(uid == ADMIN_ID),
+        "🎫 تیکت و پشتیبانی بگیری\n"
+        "🔗 دوستان را دعوت کن و اشتراک رایگان بگیر\n\n"
+        "👇 از دکمه‌های پایین شروع کن."
     )
+    send_message(chat_id, welcome, reply_markup=main_kb())
     clear_state(uid)
+
+
 
 
 def handle_account(chat_id, user):
@@ -557,7 +632,7 @@ def handle_account(chat_id, user):
         ch = "—"
         sig = "—"
     text = (
-        "👤 **حساب کاربری**\n\n"
+        "👤 *حساب کاربری*\n\n"
         f"🆔 آیدی عددی: `{uid}`\n"
         f"📛 نام: {name}\n"
         f"🔗 یوزرنیم: {uname}\n\n"
@@ -568,23 +643,26 @@ def handle_account(chat_id, user):
         f"📢 کانال امضا: {ch}\n"
         f"✍️ امضا: {sig}"
     )
-    send_message(chat_id, text, reply_markup=main_kb(uid == ADMIN_ID))
+    rowu = db.execute("SELECT ref_count FROM star_users WHERE user_id=?", (uid,), fetch="one")
+    refs = int((rowu or {}).get("ref_count") or 0)
+    text += f"\n\n🔗 دعوت‌های موفق: *{refs}*"
+    send_message(chat_id, text, reply_markup=main_kb())
 
 
 def handle_other_bots(chat_id, uid):
     text = (
-        "🤖 **ربات‌های دیگر ما**\n\n"
+        "🤖 *ربات‌های دیگر ما*\n\n"
         "🧬 ربات شبیه‌ساز زندگی\n"
         "@Shabihsaz_zendegi_bot\n\n"
         "🧮 ماشین حساب مهندسی\n"
         "@Calculator5bot"
     )
-    send_message(chat_id, text, reply_markup=main_kb(uid == ADMIN_ID))
+    send_message(chat_id, text, reply_markup=main_kb())
 
 
 def handle_help(chat_id, uid):
     text = (
-        "📖 **راهنما**\n\n"
+        "📖 *راهنما*\n\n"
         "1️⃣ روی «📝 ساخت پست» بزنید و محتوا را بفرستید.\n"
         "2️⃣ دکمه دستوری یا با دکمه (➕) بسازید.\n"
         "3️⃣ پیش‌نمایش را تأیید کنید.\n"
@@ -594,7 +672,7 @@ def handle_help(chat_id, uid):
         "🎫 پشتیبانی: از دکمه تیکت استفاده کنید.\n\n"
         f"پشتیبانی انسانی: {SUPPORT_USER}"
     )
-    send_message(chat_id, text, reply_markup=main_kb(uid == ADMIN_ID))
+    send_message(chat_id, text, reply_markup=main_kb())
 
 
 def handle_admin_panel(chat_id, uid):
@@ -602,8 +680,8 @@ def handle_admin_panel(chat_id, uid):
         return
     n = count_users()
     text = (
-        "🛠 **پنل ادمین**\n\n"
-        f"👥 تعداد کاربرانی که ربات را استارت کرده‌اند: **{n}**\n\n"
+        "🛠 *پنل ادمین*\n\n"
+        f"👥 تعداد کاربرانی که ربات را استارت کرده‌اند: *{n}*\n\n"
         "از دکمه‌های زیر استفاده کنید."
     )
     kb = {
@@ -619,25 +697,24 @@ def handle_admin_panel(chat_id, uid):
 def handle_admin_guide(chat_id, uid):
     if uid != ADMIN_ID:
         return
-    text = (
-        "📘 **راهنمای ادمین**\n\n"
-        "✅ فعال‌سازی اشتراک:\n"
-        "`برای 123456789 اشتراک 1m فعال کن`\n"
+    n = count_users()
+    msg = (
+        "📘 *راهنمای ادمین*\n\n"
+        "این بخش فقط برای شماست.\n\n"
+        "✅ فعال‌سازی:\n`برای 123456789 اشتراک 1m فعال کن`\n"
         "پلن‌ها: `1m` | `3m` | `1y`\n\n"
-        "❌ لغو اشتراک:\n"
-        "`برای 123456789 اشتراک لغو کن`\n"
-        "یا: `اشتراک 123456789 لغو`\n\n"
-        "🎫 تیکت:\n"
-        "• با دکمه «پاسخ» زیر پیام تیکت جواب بدهید\n"
-        "• برای بستن: روی پیام تیکت ریپلای کنید و بنویسید:\n"
-        "`تیکت ببند`\n"
-        "• یا دستور:\n"
-        "`بستن تیکت ST12345678`\n"
-        "• مشاهده تیکت:\n"
-        "`تیکت ST12345678`\n\n"
-        "📋 لیست اشتراک‌ها: `/subs`"
+        "❌ لغو:\n`برای 123456789 اشتراک لغو کن`\n\n"
+        "📣 اطلاع‌رسانی همگانی:\n`اطلاع رسانی ربات`\n"
+        "سپس متن/عکس/فایل یا فوروارد را بفرستید.\n\n"
+        "🎫 تیکت‌های باز:\n`تیکت های باز`\n"
+        "بستن: `بستن تیکت ST...` یا ریپلای `تیکت ببند`\n"
+        "مشاهده: `تیکت ST...`\n\n"
+        "📋 /subs\n\n"
+        f"👥 تعداد استارت‌ها: *{n}*"
     )
-    send_message(chat_id, text)
+    send_message(chat_id, msg)
+
+
 
 
 def handle_admin_stats(chat_id, uid):
@@ -654,7 +731,7 @@ def handle_admin_stats(chat_id, uid):
             pass
     send_message(
         chat_id,
-        f"📊 **آمار**\n\n👥 کل استارت‌ها: {n}\n✅ اشتراک فعال: {active}",
+        f"📊 *آمار*\n\n👥 کل استارت‌ها: {n}\n✅ اشتراک فعال: {active}",
     )
 
 
@@ -669,7 +746,7 @@ def handle_support_menu(chat_id, uid):
         ],
         "resize_keyboard": True,
     }
-    send_message(chat_id, "🎫 **تیکت و پشتیبانی**\n\nیکی از گزینه‌ها را انتخاب کنید:", reply_markup=kb)
+    send_message(chat_id, "🎫 *تیکت و پشتیبانی*\n\nیکی از گزینه‌ها را انتخاب کنید:", reply_markup=kb)
 
 
 def open_ticket_from_user(chat_id, user, text):
@@ -681,12 +758,12 @@ def open_ticket_from_user(chat_id, user, text):
     send_message(
         chat_id,
         f"✅ تیکت شما ثبت شد.\n\n🔢 شماره پیگیری: `{tracking}`\n\nپاسخ ادمین همین‌جا اعلام می‌شود.",
-        reply_markup=main_kb(uid == ADMIN_ID),
+        reply_markup=main_kb(),
     )
     clear_state(uid)
     # به ادمین
     admin_text = (
-        f"🎫 **تیکت جدید**\n\n"
+        f"🎫 *تیکت جدید*\n\n"
         f"🔢 پیگیری: `{tracking}`\n"
         f"👤 نام: {name}\n"
         f"🔗 یوزرنیم: {uname}\n"
@@ -711,7 +788,7 @@ def admin_reply_ticket(tracking, admin_text):
     add_ticket_msg(t["id"], True, admin_text)
     uid = t["user_id"]
     msg = (
-        f"💬 **پاسخ پشتیبانی** (پیگیری `{tracking}`)\n\n{admin_text}"
+        f"💬 *پاسخ پشتیبانی* (پیگیری `{tracking}`)\n\n{admin_text}"
     )
     ikb = inline(
         [
@@ -732,7 +809,7 @@ def start_create_post(chat_id, uid):
     st["data"] = {"content": {}, "buttons": [], "current_row": []}
     send_message(
         chat_id,
-        "📝 **ساخت پست**\n\n"
+        "📝 *ساخت پست*\n\n"
         "لطفاً مطلب خودتان را بفرستید.\n"
         "متن تنها، عکس، فیلم یا فایل…\n\n"
         "برای انصراف: 🔙 بازگشت",
@@ -786,10 +863,10 @@ def ask_channel(chat_id, uid):
     st["step"] = "wait_channel"
     send_message(
         chat_id,
-        "📢 **کانال مقصد**\n\n"
+        "📢 *کانال مقصد*\n\n"
         "آیدی کانال را بفرستید (با @ یا عددی).\n\n"
         f"⚠️ اگر می‌خواهید در کانال از ربات استفاده کنید:\n"
-        f"بخش **مدیران** ← **افزودن مدیر** ← سرچ کنید `{BOT_USERNAME}` و ربات را اضافه کنید.\n\n"
+        f"بخش *مدیران* ← *افزودن مدیر* ← سرچ کنید `{BOT_USERNAME}` و ربات را اضافه کنید.\n\n"
         "ربات و خودتان باید ادمین کانال باشید.",
         reply_markup=back_kb(),
     )
@@ -818,7 +895,7 @@ def ask_send_method(chat_id, uid):
         }
         send_message(
             chat_id,
-            "✍️ برای این کانال **امضا** فعال است.\n"
+            "✍️ برای این کانال *امضا* فعال است.\n"
             f"متن امضا:\n{sub['signature_text']}\n\n"
             "آیا موقع ارسال، امضا به انتهای مطلب اضافه شود؟",
             reply_markup=kb,
@@ -923,7 +1000,7 @@ def do_direct_send(chat_id, uid):
             chat_id,
             f"❌ ارسال ناموفق بود.\n{res.get('description', '')}\n"
             f"مطمئن شوید ربات ادمین کانال است و `{BOT_USERNAME}` را اضافه کرده‌اید.",
-            reply_markup=main_kb(uid == ADMIN_ID),
+            reply_markup=main_kb(),
         )
         clear_state(uid)
         return
@@ -945,7 +1022,7 @@ def do_direct_send(chat_id, uid):
     msg = "✅ پست در کانال ارسال شد."
     if link:
         msg += f"\n\n🔗 لینک پیام:\n{link}"
-    send_message(chat_id, msg, reply_markup=main_kb(uid == ADMIN_ID))
+    send_message(chat_id, msg, reply_markup=main_kb())
     clear_state(uid)
 
 
@@ -965,7 +1042,7 @@ def do_code_send(chat_id, uid):
         f"این دستور را در گروه/کانالی که ربات عضو است بفرستید:\n\n"
         f"`/start {code}`\n\n"
         "اگر ربات مجوز حذف پیام داشته باشد، خود دستور پاک می‌شود.",
-        reply_markup=main_kb(uid == ADMIN_ID),
+        reply_markup=main_kb(),
     )
     clear_state(uid)
 
@@ -986,7 +1063,7 @@ def start_signature_flow(chat_id, uid):
         st["step"] = "buy_plan"
         send_message(
             chat_id,
-            "✍️ **امضا زیر پیام**\n\n"
+            "✍️ *امضا زیر پیام*\n\n"
             "این بخش نیاز به اشتراک دارد.\n"
             "یکی از پلن‌ها را انتخاب کنید:",
             reply_markup=kb,
@@ -1026,40 +1103,79 @@ def plan_invoice(chat_id, user, plan_key, price):
     uid = user["id"]
     plan_name = {"1m": "یک‌ماهه", "3m": "سه‌ماهه", "1y": "یک‌ساله"}.get(plan_key, plan_key)
     text = (
-        f"🛒 درخواست اشتراک **{plan_name}**\n\n"
-        f"🆔 آیدی عددی کاربر: `{uid}`\n"
-        f"مبلغ: **{price} هزار تومان**\n\n"
-        f"این پیام را برای {SUPPORT_USER} فوروارد کنید و "
-        f"پاکت هدیه {price} هزار تومنی را هم ارسال کنید تا فعال شود.\n\n"
-        f"دستور فعال‌سازی برای ادمین:\n"
-        f"`برای {uid} اشتراک {plan_key} فعال کن`"
-    )
-    send_message(chat_id, text, reply_markup=main_kb(uid == ADMIN_ID))
+        "🛒 درخواست اشتراک *%s*\n\n"
+        "🆔 آیدی عددی شما: `%s`\n"
+        "مبلغ: *%s هزار تومان*\n\n"
+        "این پیام را برای %s فوروارد کنید و "
+        "پاکت هدیه *%s هزار تومنی* را هم ارسال کنید تا اشتراک شما فعال شود."
+    ) % (plan_name, uid, price, SUPPORT_USER, price)
+    send_message(chat_id, text, reply_markup=main_kb())
+    try:
+        send_message(
+            ADMIN_ID,
+            "🛒 درخواست خرید\nکاربر: `%s`\nپلن: %s (%sهزار)\nفعال‌سازی: برای %s اشتراک %s فعال کن"
+            % (uid, plan_key, price, uid, plan_key),
+        )
+    except Exception:
+        pass
     clear_state(uid)
 
 
-# ───────────────────────── پردازش پیام ─────────────────────────
+
 def process_admin_text_commands(chat_id, uid, text, msg):
     if uid != ADMIN_ID:
         return False
+    t = text.strip()
+
+    # راهنمای ادمین
+    if t in ("راهنمای ادمین", "/admin", "admin"):
+        handle_admin_guide(chat_id, uid)
+        return True
+
+    # لیست تیکت‌های باز
+    if t in ("تیکت های باز", "تیکت‌های باز", "تیکتهای باز"):
+        rows = db.execute(
+            "SELECT * FROM star_tickets WHERE status='open' ORDER BY id DESC",
+            fetch="all",
+        ) or []
+        if not rows:
+            send_message(chat_id, "تیکت بازی وجود ندارد.")
+            return True
+        lines = [f"🎫 تیکت‌های باز ({len(rows)}):"]
+        for r in rows[:40]:
+            lines.append(f"• `{r['tracking']}` | user=`{r['user_id']}` | {r.get('created_at','')[:16]}")
+        send_message(chat_id, "\n".join(lines))
+        return True
+
+    # اطلاع‌رسانی
+    if t in ("اطلاع رسانی ربات", "اطلاع‌رسانی ربات", "اطلاع رسانی"):
+        st = get_state(uid)
+        st["step"] = "broadcast_wait"
+        send_message(chat_id, "📣 پیام اطلاع‌رسانی را بفرستید (متن، عکس، فایل یا فوروارد).")
+        return True
+
     # فعال‌سازی
-    m = re.search(
+    mact = re.search(
         r"برای\s+(\d+)\s+اشتراک\s+(1m|3m|1y)\s+فعال\s*کن",
         text,
         re.I,
     )
-    if m:
-        target, plan = int(m.group(1)), m.group(2).lower()
+    if mact:
+        target, plan = int(mact.group(1)), mact.group(2).lower()
         exp = activate_sub(target, plan)
         send_message(chat_id, f"✅ اشتراک {plan} برای `{target}` تا {to_jalali(datetime.fromisoformat(exp))} فعال شد.")
-        send_message(target, f"✅ اشتراک شما ({plan}) فعال شد.\nاز منوی «✍️ امضا زیر پیام» ادامه دهید.")
+        try:
+            send_message(target, f"✅ اشتراک شما ({plan}) فعال شد.\nاز منوی «✍️ امضا زیر پیام» ادامه دهید.")
+        except Exception:
+            pass
         return True
+
     # لغو
-    m = re.search(r"برای\s+(\d+)\s+اشتراک\s+لغو\s*کن", text, re.I)
-    if not m:
-        m = re.search(r"اشتراک\s+(\d+)\s+لغو", text, re.I)
-    if m:
-        target = int(m.group(1))
+    mrev = re.search(r"برای\s+(\d+)\s+اشتراک\s+لغو\s*کن", text, re.I)
+    if not mrev:
+        mrev = re.search(r"اشتراک\s+(\d+)\s+لغو", text, re.I)
+    if mrev:
+        target = int(mrev.group(1))
         revoke_sub(target)
         send_message(chat_id, f"❌ اشتراک `{target}` لغو شد.")
         try:
@@ -1067,8 +1183,9 @@ def process_admin_text_commands(chat_id, uid, text, msg):
         except Exception:
             pass
         return True
+
     # /subs
-    if text.strip() in ("/subs", "subs"):
+    if t in ("/subs", "subs"):
         rows = db.execute("SELECT * FROM star_subs", fetch="all") or []
         if not rows:
             send_message(chat_id, "هیچ اشتراکی نیست.")
@@ -1080,46 +1197,91 @@ def process_admin_text_commands(chat_id, uid, text, msg):
             )
         send_message(chat_id, "📋 اشتراک‌ها:\n\n" + "\n".join(lines[:50]))
         return True
+
     # بستن تیکت با دستور
-    m = re.search(r"بستن\s*تیکت\s*(ST\d+)", text, re.I)
-    if m:
-        tr = m.group(1).upper()
+    mclose = re.search(r"بستن\s*تیکت\s*(ST\d+)", text, re.I)
+    if mclose:
+        tr = mclose.group(1).upper()
         close_ticket(tr)
-        t = get_ticket_by_tracking(tr)
+        tk = get_ticket_by_tracking(tr)
         send_message(chat_id, f"✅ تیکت `{tr}` بسته شد.")
-        if t:
-            send_message(t["user_id"], f"🔒 تیکت `{tr}` توسط پشتیبانی بسته شد.")
+        if tk:
+            try:
+                send_message(tk["user_id"], f"🔒 تیکت `{tr}` توسط پشتیبانی بسته شد.")
+            except Exception:
+                pass
         return True
+
     # مشاهده تیکت
-    m = re.search(r"تیکت\s+(ST\d+)", text, re.I)
-    if m:
-        tr = m.group(1).upper()
-        t = get_ticket_by_tracking(tr)
-        if not t:
+    mview = re.search(r"تیکت\s+(ST\d+)", text, re.I)
+    if mview:
+        tr = mview.group(1).upper()
+        tk = get_ticket_by_tracking(tr)
+        if not tk:
             send_message(chat_id, "تیکت پیدا نشد.")
             return True
-        msgs = ticket_msgs(t["id"])
-        body = [
-            f"🎫 تیکت `{tr}` | status={t['status']} | user=`{t['user_id']}`"
-        ]
+        msgs = ticket_msgs(tk["id"])
+        body = [f"🎫 تیکت `{tr}` | status={tk['status']} | user=`{tk['user_id']}`"]
         for x in msgs:
             who = "ادمین" if x["from_admin"] else "کاربر"
             body.append(f"• [{who}] {x['text']}")
         send_message(chat_id, "\n".join(body)[:3500])
         return True
+
     # ریپلای روی پیام تیکت: «تیکت ببند»
-    if text.strip() in ("تیکت ببند", "بستن تیکت") and msg.get("reply_to_message"):
+    if t in ("تیکت ببند", "بستن تیکت") and msg.get("reply_to_message"):
         rt = msg["reply_to_message"].get("text") or ""
-        m = re.search(r"(ST\d+)", rt)
-        if m:
-            tr = m.group(1).upper()
+        mm = re.search(r"(ST\d+)", rt)
+        if mm:
+            tr = mm.group(1).upper()
             close_ticket(tr)
-            t = get_ticket_by_tracking(tr)
+            tk = get_ticket_by_tracking(tr)
             send_message(chat_id, f"✅ تیکت `{tr}` بسته شد.")
-            if t:
-                send_message(t["user_id"], f"🔒 تیکت `{tr}` بسته شد.")
+            if tk:
+                try:
+                    send_message(tk["user_id"], f"🔒 تیکت `{tr}` بسته شد.")
+                except Exception:
+                    pass
             return True
     return False
+
+
+def copy_message_to_chat(to_chat_id, from_chat_id, message_id):
+    """کپی پیام (برای فوروارد/مدیا در اطلاع‌رسانی)"""
+    return api(
+        "copyMessage",
+        chat_id=to_chat_id,
+        from_chat_id=from_chat_id,
+        message_id=message_id,
+    )
+
+
+def broadcast_message(admin_chat_id, msg):
+    users = db.execute("SELECT user_id FROM star_users", fetch="all") or []
+    ok = fail = 0
+    mid = msg.get("message_id")
+    from_chat = admin_chat_id
+    for u in users:
+        uid = u["user_id"]
+        try:
+            # اول copyMessage (عکس/فایل/فوروارد)
+            r = copy_message_to_chat(uid, from_chat, mid)
+            if r.get("ok"):
+                ok += 1
+            else:
+                # فالبک متن
+                txt = msg.get("text") or msg.get("caption")
+                if txt:
+                    send_message(uid, txt)
+                    ok += 1
+                else:
+                    fail += 1
+        except Exception:
+            fail += 1
+        time.sleep(0.05)
+    send_message(admin_chat_id, f"📣 اطلاع‌رسانی تمام شد.\n✅ موفق: {ok}\n❌ ناموفق: {fail}")
+
+
 
 
 def process_message(msg):
@@ -1137,6 +1299,13 @@ def process_message(msg):
     is_private = chat_type == "private"
 
     # دستور کد در گروه/کانال
+    # /restart در هر مرحله
+    if is_private and text.strip().lower() in ("/restart", "restart"):
+        clear_state(uid)
+        ensure_user(user)
+        send_message(chat_id, "به منوی اصلی برگشتید.", reply_markup=main_kb())
+        return
+
     if text.startswith("/start"):
         if is_private:
             handle_start(chat_id, user, text)
@@ -1169,10 +1338,16 @@ def process_message(msg):
     st = get_state(uid)
     step = st.get("step")
 
+    # اطلاع‌رسانی (ادمین)
+    if step == "broadcast_wait" and uid == ADMIN_ID:
+        broadcast_message(chat_id, msg)
+        clear_state(uid)
+        return
+
     # دکمه‌های ثابت منو
     if text == "🔙 بازگشت" or text == "🔙 بازگشت به منو":
         clear_state(uid)
-        send_message(chat_id, "منوی اصلی:", reply_markup=main_kb(uid == ADMIN_ID))
+        send_message(chat_id, "منوی اصلی:", reply_markup=main_kb())
         return
 
     if text == "📝 ساخت پست":
@@ -1188,6 +1363,27 @@ def process_message(msg):
     if text == "🎫 تیکت و پشتیبانی":
         handle_support_menu(chat_id, uid)
         return
+    if text == "🔗 دعوت دوستان":
+        clear_state(uid)
+        link = "https://ble.ir/%s?start=ref_%s" % (BOT_USERNAME, uid)
+        row = db.execute("SELECT ref_count FROM star_users WHERE user_id=?", (uid,), fetch="one")
+        cnt = int((row or {}).get("ref_count") or 0)
+        next_need = 3 - (cnt % 3)
+        if next_need == 0:
+            next_need = 3
+        months_next = min((cnt // 3) + 1, 12)
+        msg = (
+            "🔗 *دعوت دوستان*\n\n"
+            "با معرفی ربات به دوستان، اشتراک رایگان بگیر!\n\n"
+            "لینک اختصاصی شما:\n%s\n\n"
+            "✅ دعوت موفق تا الان: *%d*\n"
+            "برای پاداش بعدی *%d* دعوت دیگر لازم است (پاداش بعدی: *%d ماه*).\n\n"
+            "هر ۳ دعوت موفق = اشتراک هدیه (۱ تا ۱۲ ماه)\n"
+            "مدت اشتراک‌ها با هم جمع می‌شود."
+        ) % (link, cnt, next_need, months_next)
+        send_message(chat_id, msg, reply_markup=main_kb())
+        return
+
     if text == "🤖 ربات‌های دیگر ما":
         clear_state(uid)
         handle_other_bots(chat_id, uid)
@@ -1196,22 +1392,13 @@ def process_message(msg):
         clear_state(uid)
         handle_help(chat_id, uid)
         return
-    if text == "🛠 پنل ادمین" and uid == ADMIN_ID:
-        handle_admin_panel(chat_id, uid)
-        return
-    if text == "📊 آمار کاربران" and uid == ADMIN_ID:
-        handle_admin_stats(chat_id, uid)
-        return
-    if text == "📘 راهنمای ادمین" and uid == ADMIN_ID:
-        handle_admin_guide(chat_id, uid)
-        return
 
     # پشتیبانی
     if text == "💬 پشتیبانی در پیوی":
         send_message(
             chat_id,
             f"برای پشتیبانی مستقیم پیام دهید:\n{SUPPORT_USER}",
-            reply_markup=main_kb(uid == ADMIN_ID),
+            reply_markup=main_kb(),
         )
         clear_state(uid)
         return
@@ -1232,7 +1419,7 @@ def process_message(msg):
         tr = step.split(":", 1)[1]
         t = get_ticket_by_tracking(tr)
         if not t or t["status"] != "open":
-            send_message(chat_id, "این تیکت بسته است.", reply_markup=main_kb(uid == ADMIN_ID))
+            send_message(chat_id, "این تیکت بسته است.", reply_markup=main_kb())
             clear_state(uid)
             return
         add_ticket_msg(t["id"], False, text)
@@ -1250,7 +1437,7 @@ def process_message(msg):
             ]
         )
         send_message(ADMIN_ID, admin_text, reply_markup=ikb)
-        send_message(chat_id, "✅ پیام شما ارسال شد.", reply_markup=main_kb(uid == ADMIN_ID))
+        send_message(chat_id, "✅ پیام شما ارسال شد.", reply_markup=main_kb())
         clear_state(uid)
         return
 
@@ -1285,7 +1472,7 @@ def process_message(msg):
         }
         send_message(
             chat_id,
-            "آیا ربات اجازه **ویرایش پیام** در کانال دارد؟\n"
+            "آیا ربات اجازه *ویرایش پیام* در کانال دارد؟\n"
             "(اگر نه، امضا به‌صورت ریپلای زیر پست ارسال می‌شود)",
             reply_markup=kb,
         )
@@ -1313,7 +1500,7 @@ def process_message(msg):
         send_message(
             chat_id,
             f"✅ امضا ذخیره شد.\n📢 کانال: {ch}\n\nاز این به بعد زیر پست‌های این کانال اعمال می‌شود.",
-            reply_markup=main_kb(uid == ADMIN_ID),
+            reply_markup=main_kb(),
         )
         clear_state(uid)
         return
@@ -1390,7 +1577,7 @@ def process_message(msg):
             ],
             "resize_keyboard": True,
         }
-        send_message(chat_id, f"👁 **پیش‌نمایش**\n\n{prev}", reply_markup=kb)
+        send_message(chat_id, f"👁 *پیش‌نمایش*\n\n{prev}", reply_markup=kb)
         send_post_payload(chat_id, {"content": st["data"]["content"], "buttons": rows})
         return
 
@@ -1419,7 +1606,7 @@ def process_message(msg):
                 ],
                 "resize_keyboard": True,
             }
-            send_message(chat_id, f"👁 **پیش‌نمایش**\n\n{prev}", reply_markup=kb)
+            send_message(chat_id, f"👁 *پیش‌نمایش*\n\n{prev}", reply_markup=kb)
             send_post_payload(
                 chat_id,
                 {"content": st["data"]["content"], "buttons": st["data"].get("buttons") or []},
@@ -1514,7 +1701,7 @@ def process_message(msg):
         send_message(
             chat_id,
             "از دکمه‌های پایین استفاده کنید 👇",
-            reply_markup=main_kb(uid == ADMIN_ID),
+            reply_markup=main_kb(),
         )
 
 
