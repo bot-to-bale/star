@@ -1,1095 +1,1667 @@
 #!/usr/bin/env python3
-"""ربات استار — سازنده دکمه شیشه‌ای بله. اجرا با long polling روی سرور مجازی."""
+# -*- coding: utf-8 -*-
+"""
+استار | دکمه‌ساز شیشه‌ای بله
+ربات کامل با حساب کاربری، تیکت، امضا، اشتراک، ارسال پست
+"""
 
-import json
-import logging
 import os
 import re
-import secrets
-import sqlite3
-import threading
+import json
 import time
-from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+import logging
+import sqlite3
+import secrets
+import string
+import threading
+from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.environ["BALE_TOKEN"]
+# ───────────────────────── تنظیمات ─────────────────────────
+TOKEN = os.environ.get("BALE_TOKEN") or os.environ.get("TOKEN")
+if not TOKEN:
+    raise SystemExit("BALE_TOKEN تنظیم نشده")
+
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "1369192211"))
-DB_PATH = os.environ.get("DB_PATH", str(Path(__file__).resolve().parent / "data" / "bot.db"))
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "Glass_star_bot")
+SUPPORT_USER = "@fazellrahimii"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DB_PATH = os.environ.get("DB_PATH", "./data/bot.db")
+
 API = f"https://tapi.bale.ai/bot{TOKEN}"
 
-PLANS = {
-    "1m": {"days": 30, "amount": 7000, "title": "یک‌ماهه"},
-    "3m": {"days": 90, "amount": 12000, "title": "سه‌ماهه"},
-    "1y": {"days": 365, "amount": 80000, "title": "یک‌ساله"},
-}
-PLAN_ALIASES = {
-    "1m": "1m", "۱m": "1m", "یکماهه": "1m", "یک‌ماهه": "1m", "یکماه": "1m",
-    "3m": "3m", "۳m": "3m", "سه‌ماهه": "3m", "سهماهه": "3m", "سه‌ماه": "3m",
-    "1y": "1y", "۱y": "1y", "یکساله": "1y", "یک‌ساله": "1y", "یکسال": "1y",
-}
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 log = logging.getLogger("star")
 
-MEDIA_FIELDS = (
-    ("photo", "photo", True),
-    ("video", "video", True),
-    ("animation", "animation", True),
-    ("document", "document", True),
-    ("audio", "audio", True),
-    ("voice", "voice", False),
-    ("video_note", "video_note", False),
-)
-SEND_METHOD = {
-    "text": ("sendMessage", "text"),
-    "photo": ("sendPhoto", "photo"),
-    "video": ("sendVideo", "video"),
-    "animation": ("sendAnimation", "animation"),
-    "document": ("sendDocument", "document"),
-    "audio": ("sendAudio", "audio"),
-    "voice": ("sendVoice", "voice"),
-    "video_note": ("sendVideoNote", "video_note"),
-}
+# ───────────────────────── تاریخ شمسی ساده ─────────────────────────
+def to_jalali(dt: datetime) -> str:
+    """تبدیل تقریبی میلادی به شمسی (کافی برای نمایش)"""
+    if dt is None:
+        return "—"
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", ""))
+        except Exception:
+            return dt
+    g_y, g_m, g_d = dt.year, dt.month, dt.day
+    g_days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    jy = g_y - 621 if g_m > 2 or (g_m == 2 and g_d >= 20) else g_y - 622
+    # الگوریتم ساده و پایدار
+    gy2 = g_y + 1 if g_m > 2 else g_y
+    days = (
+        365 * g_y
+        + (gy2 + 3) // 4
+        - (gy2 + 99) // 100
+        + (gy2 + 399) // 400
+        - 80
+        + g_d
+        + sum(g_days_in_month[:g_m])
+    )
+    j_days_in_month = [31, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 29]
+    jy = -1595 + 33 * (days // 12053)
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    jm = 0
+    for i, dim in enumerate(j_days_in_month):
+        if days < dim:
+            jm = i + 1
+            jd = days + 1
+            break
+        days -= dim
+    else:
+        jm, jd = 12, days + 1
+    return f"{jy:04d}/{jm:02d}/{jd:02d}"
 
 
-def utcnow():
-    return datetime.now(timezone.utc)
+def remaining_text(expires_at) -> str:
+    if not expires_at:
+        return "ندارد"
+    if isinstance(expires_at, str):
+        try:
+            expires_at = datetime.fromisoformat(expires_at.replace("Z", ""))
+        except Exception:
+            return "نامشخص"
+    now = datetime.utcnow()
+    if expires_at <= now:
+        return "منقضی شده"
+    delta = expires_at - now
+    days = delta.days
+    hours = delta.seconds // 3600
+    if days > 0:
+        return f"{days} روز و {hours} ساعت"
+    mins = (delta.seconds % 3600) // 60
+    return f"{hours} ساعت و {mins} دقیقه"
 
 
-def db():
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+# ───────────────────────── دیتابیس ─────────────────────────
+_pg = None
+_use_pg = bool(DATABASE_URL)
 
 
-@contextmanager
-def connect():
-    conn = db()
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+def _connect_pg():
+    global _pg
+    import psycopg2
+    import psycopg2.extras
+
+    if _pg is None or _pg.closed:
+        _pg = psycopg2.connect(DATABASE_URL, sslmode="require")
+        _pg.autocommit = True
+    return _pg
 
 
-def init_db():
-    with connect() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS states (
-                user_id INTEGER PRIMARY KEY,
-                state TEXT NOT NULL,
-                data TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS drafts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                caption TEXT,
-                buttons TEXT NOT NULL,
-                code TEXT UNIQUE,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS subs (
-                user_id INTEGER PRIMARY KEY,
+class DB:
+    """لایه نازک SQLite / Postgres با پیشوند star_"""
+
+    def __init__(self):
+        if _use_pg:
+            self.kind = "pg"
+        else:
+            self.kind = "sqlite"
+            os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+            self.path = DB_PATH
+
+    def conn(self):
+        if self.kind == "pg":
+            return _connect_pg()
+        c = sqlite3.connect(self.path, check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        return c
+
+    def execute(self, sql, params=(), fetch=None):
+        # تبدیل ? به %s برای postgres
+        if self.kind == "pg":
+            sql = sql.replace("?", "%s")
+            conn = self.conn()
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            if fetch == "one":
+                row = cur.fetchone()
+                if not row:
+                    return None
+                cols = [d[0] for d in cur.description]
+                return dict(zip(cols, row))
+            if fetch == "all":
+                cols = [d[0] for d in cur.description] if cur.description else []
+                return [dict(zip(cols, r)) for r in cur.fetchall()]
+            return cur.rowcount
+        else:
+            conn = self.conn()
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            if fetch == "one":
+                row = cur.fetchone()
+                conn.commit()
+                conn.close()
+                return dict(row) if row else None
+            if fetch == "all":
+                rows = cur.fetchall()
+                conn.commit()
+                conn.close()
+                return [dict(r) for r in rows]
+            conn.commit()
+            conn.close()
+            return cur.rowcount
+
+    def init(self):
+        stmts = [
+            """CREATE TABLE IF NOT EXISTS star_users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                started_at TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS star_subs (
+                user_id BIGINT PRIMARY KEY,
                 plan TEXT,
-                active INTEGER NOT NULL DEFAULT 0,
                 expires_at TEXT,
                 channel_id TEXT,
-                channel_username TEXT,
-                signature TEXT,
-                can_edit INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-            """
-        )
+                signature_text TEXT,
+                can_edit INTEGER DEFAULT 0
+            )""",
+            """CREATE TABLE IF NOT EXISTS star_codes (
+                code TEXT PRIMARY KEY,
+                owner_id BIGINT,
+                payload TEXT,
+                created_at TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS star_tickets (
+                id INTEGER PRIMARY KEY,
+                tracking TEXT UNIQUE,
+                user_id BIGINT,
+                status TEXT,
+                created_at TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS star_ticket_msgs (
+                id INTEGER PRIMARY KEY,
+                ticket_id INTEGER,
+                from_admin INTEGER,
+                text TEXT,
+                created_at TEXT
+            )""",
+        ]
+        # postgres: SERIAL
+        if self.kind == "pg":
+            stmts = [
+                """CREATE TABLE IF NOT EXISTS star_users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    started_at TEXT
+                )""",
+                """CREATE TABLE IF NOT EXISTS star_subs (
+                    user_id BIGINT PRIMARY KEY,
+                    plan TEXT,
+                    expires_at TEXT,
+                    channel_id TEXT,
+                    signature_text TEXT,
+                    can_edit INTEGER DEFAULT 0
+                )""",
+                """CREATE TABLE IF NOT EXISTS star_codes (
+                    code TEXT PRIMARY KEY,
+                    owner_id BIGINT,
+                    payload TEXT,
+                    created_at TEXT
+                )""",
+                """CREATE TABLE IF NOT EXISTS star_tickets (
+                    id SERIAL PRIMARY KEY,
+                    tracking TEXT UNIQUE,
+                    user_id BIGINT,
+                    status TEXT,
+                    created_at TEXT
+                )""",
+                """CREATE TABLE IF NOT EXISTS star_ticket_msgs (
+                    id SERIAL PRIMARY KEY,
+                    ticket_id INTEGER,
+                    from_admin INTEGER,
+                    text TEXT,
+                    created_at TEXT
+                )""",
+            ]
+        for s in stmts:
+            try:
+                self.execute(s)
+            except Exception as e:
+                log.warning("init table: %s", e)
+        log.info("db ready kind=%s", self.kind)
 
 
-def get_state(user_id):
-    with connect() as conn:
-        row = conn.execute("SELECT state, data FROM states WHERE user_id=?", (user_id,)).fetchone()
-    if not row:
-        return "idle", {}
-    return row["state"], json.loads(row["data"] or "{}")
+db = DB()
+
+# ───────────────────────── وضعیت موقت کاربران ─────────────────────────
+# state[user_id] = dict
+states = {}
+
+def get_state(uid):
+    return states.setdefault(uid, {"step": None, "data": {}})
+
+def clear_state(uid):
+    states.pop(uid, None)
 
 
-def set_state(user_id, state, data=None):
-    payload = json.dumps(data or {}, ensure_ascii=False)
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO states(user_id, state, data) VALUES(?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET state=excluded.state, data=excluded.data",
-            (user_id, state, payload),
-        )
-
-
-def meta_get(key, default=None):
-    with connect() as conn:
-        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else default
-
-
-def meta_set(key, value):
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, str(value)),
-        )
-
-
-def api(method, **payload):
+# ───────────────────────── API بله ─────────────────────────
+def api(method, **kwargs):
     try:
-        r = requests.post(f"{API}/{method}", json=payload, timeout=40)
+        r = requests.post(f"{API}/{method}", json=kwargs, timeout=30)
         data = r.json()
-    except Exception as exc:
-        log.exception("api %s failed", method)
-        return {"ok": False, "description": str(exc)}
-    if not data.get("ok"):
-        log.warning("api %s: %s", method, data)
-    return data
+        if not data.get("ok"):
+            log.warning("api %s: %s", method, data)
+        return data
+    except Exception as e:
+        log.exception("api %s error: %s", method, e)
+        return {"ok": False, "description": str(e)}
 
 
-def send(chat_id, text, reply_markup=None):
-    body = {"chat_id": chat_id, "text": text}
+def send_message(chat_id, text, reply_markup=None, reply_to=None):
+    payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
-        body["reply_markup"] = reply_markup
-    return api("sendMessage", **body)
+        payload["reply_markup"] = reply_markup
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    return api("sendMessage", **payload)
 
 
-def answer_cb(callback_id, text=None):
-    body = {"callback_query_id": callback_id}
+def edit_message(chat_id, message_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return api("editMessageText", **payload)
+
+
+def answer_callback(cq_id, text=None):
+    payload = {"callback_query_id": cq_id}
     if text:
-        body["text"] = text
-    return api("answerCallbackQuery", **body)
+        payload["text"] = text
+    return api("answerCallbackQuery", **payload)
 
 
-KB_MAIN = {
-    "keyboard": [
+def delete_message(chat_id, message_id):
+    return api("deleteMessage", chat_id=chat_id, message_id=message_id)
+
+
+def get_chat_member(chat_id, user_id):
+    return api("getChatMember", chat_id=chat_id, user_id=user_id)
+
+
+def get_chat(chat_id):
+    return api("getChat", chat_id=chat_id)
+
+
+# ───────────────────────── کیبوردها ─────────────────────────
+def main_kb(is_admin=False):
+    rows = [
         [{"text": "📝 ساخت پست"}],
-        [{"text": "📖 راهنما"}, {"text": "✍️ امضا زیر پیام"}],
-    ],
-    "resize_keyboard": True,
-}
-KB_BACK = {"keyboard": [[{"text": "🔙 بازگشت"}]], "resize_keyboard": True}
-KB_TYPE = {
-    "keyboard": [
-        [{"text": "⌨️ ساخت دکمه دستوری"}, {"text": "➕ با دکمه"}],
-        [{"text": "🔙 بازگشت"}],
-    ],
-    "resize_keyboard": True,
-}
-KB_DONE = {"keyboard": [[{"text": "✅ تمام"}], [{"text": "🔙 بازگشت"}]], "resize_keyboard": True}
-KB_YESNO = {
-    "keyboard": [[{"text": "✅ بله"}, {"text": "❌ خیر"}], [{"text": "🔙 بازگشت"}]],
-    "resize_keyboard": True,
-}
+        [{"text": "👤 حساب کاربری"}, {"text": "✍️ امضا زیر پیام"}],
+        [{"text": "🎫 تیکت و پشتیبانی"}, {"text": "🤖 ربات‌های دیگر ما"}],
+        [{"text": "📖 راهنما"}],
+    ]
+    if is_admin:
+        rows.append([{"text": "🛠 پنل ادمین"}])
+    return {"keyboard": rows, "resize_keyboard": True}
 
 
-def norm_btn(text):
-    t = (text or "").strip()
-    for ch in "📝📖✍️🔙✅❌➕⌨️🔘📦🔗⚙️✨🌟💫🎉":
-        t = t.replace(ch, "")
-    return " ".join(t.split())
+def back_kb(text="🔙 بازگشت"):
+    return {"keyboard": [[{"text": text}]], "resize_keyboard": True}
 
 
-def is_btn(text, *labels):
-    n = norm_btn(text)
-    return any(n == norm_btn(label) or n == label for label in labels)
+def cancel_kb():
+    return {"keyboard": [[{"text": "🔙 بازگشت"}]], "resize_keyboard": True}
 
 
-def kb_preview():
-    return {
-        "inline_keyboard": [[
-            {"text": "✅ درست است", "callback_data": "pok"},
-            {"text": "✏️ نیاز به اصلاح دارد", "callback_data": "pedit"},
-        ]]
-    }
-
-
-def kb_send_method():
-    return {
-        "inline_keyboard": [
-            [{"text": "📢 ارسال مستقیم در کانال", "callback_data": "sdir"}],
-            [{"text": "🔑 ارسال با دستور", "callback_data": "scmd"}],
-        ]
-    }
-
-
-def kb_plans():
-    return {
-        "inline_keyboard": [
-            [{"text": "📅 یک‌ماهه — ۷ هزار", "callback_data": "sub1"}],
-            [{"text": "📆 سه‌ماهه — ۱۲ هزار", "callback_data": "sub3"}],
-            [{"text": "🏆 یک‌ساله — ۸۰ هزار", "callback_data": "suby"}],
-        ]
-    }
-
-
-def kb_sig_manage():
-    return {
-        "inline_keyboard": [
-            [{"text": "✏️ ویرایش متن امضا", "callback_data": "esig"}],
-            [{"text": "📢 تغییر آیدی کانال", "callback_data": "echan"}],
-        ]
-    }
-
-
-def url_keyboard(buttons):
-    return {"inline_keyboard": buttons} if buttons else None
-
-
-def plus_keyboard(buttons):
-    if not buttons:
-        return {"inline_keyboard": [[{"text": "➕", "callback_data": "pnew"}]]}
-    rows = []
-    for i, row in enumerate(buttons):
-        built = [{"text": b["text"], "url": b["url"]} for b in row]
-        if i == len(buttons) - 1:
-            built.append({"text": "➕", "callback_data": "psame"})
-        rows.append(built)
-    rows.append([{"text": "➕", "callback_data": "pnew"}])
+def inline(rows):
     return {"inline_keyboard": rows}
 
 
-def extract_content(message):
-    caption = message.get("caption")
-    if message.get("text"):
-        return {"kind": "text", "payload": message["text"], "caption": None}
-    for field, kind, has_caption in MEDIA_FIELDS:
-        if field not in message:
-            continue
-        media = message[field]
-        file_id = media[-1]["file_id"] if field == "photo" else media["file_id"]
-        return {"kind": kind, "payload": file_id, "caption": caption if has_caption else None}
-    return None
+# ───────────────────────── کاربران و اشتراک ─────────────────────────
+def ensure_user(user):
+    uid = user["id"]
+    username = user.get("username") or ""
+    first_name = user.get("first_name") or ""
+    now = datetime.utcnow().isoformat()
+    row = db.execute("SELECT user_id FROM star_users WHERE user_id=?", (uid,), fetch="one")
+    if not row:
+        db.execute(
+            "INSERT INTO star_users (user_id, username, first_name, started_at) VALUES (?,?,?,?)",
+            (uid, username, first_name, now),
+        )
+    else:
+        db.execute(
+            "UPDATE star_users SET username=?, first_name=? WHERE user_id=?",
+            (username, first_name, uid),
+        )
 
 
-def deliver(chat_id, draft, buttons=None):
-    kind = draft["kind"]
-    method, field = SEND_METHOD[kind]
-    body = {"chat_id": chat_id, field: draft["payload"]}
-    if kind != "text" and draft.get("caption"):
-        body["caption"] = draft["caption"]
+def get_sub(uid):
+    return db.execute("SELECT * FROM star_subs WHERE user_id=?", (uid,), fetch="one")
+
+
+def is_sub_active(uid):
+    sub = get_sub(uid)
+    if not sub or not sub.get("expires_at"):
+        return False
+    try:
+        exp = datetime.fromisoformat(sub["expires_at"].replace("Z", ""))
+        return exp > datetime.utcnow()
+    except Exception:
+        return False
+
+
+def activate_sub(uid, plan):
+    days = {"1m": 30, "3m": 90, "1y": 365}.get(plan, 30)
+    exp = (datetime.utcnow() + timedelta(days=days)).isoformat()
+    row = get_sub(uid)
+    if row:
+        db.execute(
+            "UPDATE star_subs SET plan=?, expires_at=? WHERE user_id=?",
+            (plan, exp, uid),
+        )
+    else:
+        db.execute(
+            "INSERT INTO star_subs (user_id, plan, expires_at, channel_id, signature_text, can_edit) VALUES (?,?,?,?,?,?)",
+            (uid, plan, exp, None, None, 0),
+        )
+    return exp
+
+
+def revoke_sub(uid):
+    db.execute("DELETE FROM star_subs WHERE user_id=?", (uid,))
+
+
+def count_users():
+    row = db.execute("SELECT COUNT(*) AS c FROM star_users", fetch="one")
+    return row["c"] if row else 0
+
+
+# ───────────────────────── تیکت ─────────────────────────
+def new_tracking():
+    return "ST" + "".join(secrets.choice(string.digits) for _ in range(8))
+
+
+def create_ticket(user_id, text):
+    tracking = new_tracking()
+    now = datetime.utcnow().isoformat()
+    # insert ticket
+    if db.kind == "pg":
+        db.execute(
+            "INSERT INTO star_tickets (tracking, user_id, status, created_at) VALUES (?,?,?,?)",
+            (tracking, user_id, "open", now),
+        )
+        row = db.execute(
+            "SELECT id FROM star_tickets WHERE tracking=?", (tracking,), fetch="one"
+        )
+        tid = row["id"]
+    else:
+        db.execute(
+            "INSERT INTO star_tickets (tracking, user_id, status, created_at) VALUES (?,?,?,?)",
+            (tracking, user_id, "open", now),
+        )
+        row = db.execute(
+            "SELECT id FROM star_tickets WHERE tracking=?", (tracking,), fetch="one"
+        )
+        tid = row["id"]
+    db.execute(
+        "INSERT INTO star_ticket_msgs (ticket_id, from_admin, text, created_at) VALUES (?,?,?,?)",
+        (tid, 0, text, now),
+    )
+    return tracking, tid
+
+
+def get_ticket_by_tracking(tracking):
+    return db.execute(
+        "SELECT * FROM star_tickets WHERE tracking=?", (tracking,), fetch="one"
+    )
+
+
+def get_open_ticket_for_user(uid):
+    return db.execute(
+        "SELECT * FROM star_tickets WHERE user_id=? AND status='open' ORDER BY id DESC",
+        (uid,),
+        fetch="one",
+    )
+
+
+def add_ticket_msg(ticket_id, from_admin, text):
+    now = datetime.utcnow().isoformat()
+    db.execute(
+        "INSERT INTO star_ticket_msgs (ticket_id, from_admin, text, created_at) VALUES (?,?,?,?)",
+        (ticket_id, 1 if from_admin else 0, text, now),
+    )
+
+
+def close_ticket(tracking):
+    db.execute(
+        "UPDATE star_tickets SET status='closed' WHERE tracking=?", (tracking,)
+    )
+
+
+def ticket_msgs(ticket_id):
+    return db.execute(
+        "SELECT * FROM star_ticket_msgs WHERE ticket_id=? ORDER BY id",
+        (ticket_id,),
+        fetch="all",
+    )
+
+
+# ───────────────────────── ساخت پست / امضا ─────────────────────────
+def build_inline_from_buttons(buttons):
+    """
+    buttons: list of rows, each row list of {text, url}
+    """
+    rows = []
+    for row in buttons:
+        rows.append([{"text": b["text"], "url": b["url"]} for b in row])
+    return {"inline_keyboard": rows} if rows else None
+
+
+def format_preview(content, buttons):
+    lines = []
+    if content.get("text"):
+        lines.append(content["text"])
+    if content.get("type") and content["type"] != "text":
+        lines.append(f"[{content['type']}]")
     if buttons:
-        body["reply_markup"] = url_keyboard(buttons)
-    return api(method, **body)
+        lines.append("\nدکمه‌ها:")
+        for row in buttons:
+            lines.append(" | ".join(f"{b['text']} → {b['url']}" for b in row))
+    return "\n".join(lines) if lines else "(خالی)"
 
 
-def show_post(chat_id, draft, markup):
-    return deliver(chat_id, draft, None if markup is None else markup.get("inline_keyboard"))
+# ───────────────────────── هندلرها ─────────────────────────
+def handle_start(chat_id, user, text):
+    ensure_user(user)
+    uid = user["id"]
+    # /start CODE
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) == 2:
+        code = parts[1].strip()
+        row = db.execute(
+            "SELECT * FROM star_codes WHERE code=?", (code,), fetch="one"
+        )
+        if row:
+            try:
+                payload = json.loads(row["payload"])
+                send_post_payload(chat_id, payload)
+                # سعی در حذف پیام دستور
+                return
+            except Exception as e:
+                log.warning("code post: %s", e)
+    send_message(
+        chat_id,
+        "🌟 سلام! به ربات **استار** خوش آمدید.\n\n"
+        "با من می‌تونی:\n"
+        "📝 پست با دکمه شیشه‌ای بسازی\n"
+        "📢 مستقیم یا با دستور به کانال بفرستی\n"
+        "✍️ امضا زیر پست‌های کانالت بذاری\n"
+        "🎫 تیکت و پشتیبانی بگیری\n\n"
+        "👇 از دکمه‌های پایین شروع کن.",
+        reply_markup=main_kb(uid == ADMIN_ID),
+    )
+    clear_state(uid)
+
+
+def handle_account(chat_id, user):
+    uid = user["id"]
+    ensure_user(user)
+    sub = get_sub(uid)
+    active = is_sub_active(uid)
+    uname = f"@{user.get('username')}" if user.get("username") else "—"
+    name = user.get("first_name") or "—"
+    if active and sub:
+        exp = sub.get("expires_at")
+        try:
+            exp_dt = datetime.fromisoformat(exp.replace("Z", ""))
+        except Exception:
+            exp_dt = None
+        status = "✅ فعال"
+        remain = remaining_text(exp)
+        jalali = to_jalali(exp_dt)
+        plan = sub.get("plan") or "—"
+        ch = sub.get("channel_id") or "تنظیم نشده"
+        sig = "دارد" if sub.get("signature_text") else "ندارد"
+    else:
+        status = "❌ غیرفعال"
+        remain = "—"
+        jalali = "—"
+        plan = "—"
+        ch = "—"
+        sig = "—"
+    text = (
+        "👤 **حساب کاربری**\n\n"
+        f"🆔 آیدی عددی: `{uid}`\n"
+        f"📛 نام: {name}\n"
+        f"🔗 یوزرنیم: {uname}\n\n"
+        f"📦 وضعیت اشتراک: {status}\n"
+        f"🗓 پلن: {plan}\n"
+        f"⏳ مانده: {remain}\n"
+        f"📅 تاریخ اتمام (شمسی): {jalali}\n"
+        f"📢 کانال امضا: {ch}\n"
+        f"✍️ امضا: {sig}"
+    )
+    send_message(chat_id, text, reply_markup=main_kb(uid == ADMIN_ID))
+
+
+def handle_other_bots(chat_id, uid):
+    text = (
+        "🤖 **ربات‌های دیگر ما**\n\n"
+        "🧬 ربات شبیه‌ساز زندگی\n"
+        "@Shabihsaz_zendegi_bot\n\n"
+        "🧮 ماشین حساب مهندسی\n"
+        "@Calculator5bot"
+    )
+    send_message(chat_id, text, reply_markup=main_kb(uid == ADMIN_ID))
+
+
+def handle_help(chat_id, uid):
+    text = (
+        "📖 **راهنما**\n\n"
+        "1️⃣ روی «📝 ساخت پست» بزنید و محتوا را بفرستید.\n"
+        "2️⃣ دکمه دستوری یا با دکمه (➕) بسازید.\n"
+        "3️⃣ پیش‌نمایش را تأیید کنید.\n"
+        "4️⃣ آیدی کانال را بفرستید (با @ یا عددی).\n"
+        "5️⃣ ارسال مستقیم یا با دستور را انتخاب کنید.\n\n"
+        "✍️ امضا: بعد از فعال‌سازی اشتراک، کانال و متن امضا را تنظیم کنید.\n"
+        "🎫 پشتیبانی: از دکمه تیکت استفاده کنید.\n\n"
+        f"پشتیبانی انسانی: {SUPPORT_USER}"
+    )
+    send_message(chat_id, text, reply_markup=main_kb(uid == ADMIN_ID))
+
+
+def handle_admin_panel(chat_id, uid):
+    if uid != ADMIN_ID:
+        return
+    n = count_users()
+    text = (
+        "🛠 **پنل ادمین**\n\n"
+        f"👥 تعداد کاربرانی که ربات را استارت کرده‌اند: **{n}**\n\n"
+        "از دکمه‌های زیر استفاده کنید."
+    )
+    kb = {
+        "keyboard": [
+            [{"text": "📊 آمار کاربران"}, {"text": "📘 راهنمای ادمین"}],
+            [{"text": "🔙 بازگشت به منو"}],
+        ],
+        "resize_keyboard": True,
+    }
+    send_message(chat_id, text, reply_markup=kb)
+
+
+def handle_admin_guide(chat_id, uid):
+    if uid != ADMIN_ID:
+        return
+    text = (
+        "📘 **راهنمای ادمین**\n\n"
+        "✅ فعال‌سازی اشتراک:\n"
+        "`برای 123456789 اشتراک 1m فعال کن`\n"
+        "پلن‌ها: `1m` | `3m` | `1y`\n\n"
+        "❌ لغو اشتراک:\n"
+        "`برای 123456789 اشتراک لغو کن`\n"
+        "یا: `اشتراک 123456789 لغو`\n\n"
+        "🎫 تیکت:\n"
+        "• با دکمه «پاسخ» زیر پیام تیکت جواب بدهید\n"
+        "• برای بستن: روی پیام تیکت ریپلای کنید و بنویسید:\n"
+        "`تیکت ببند`\n"
+        "• یا دستور:\n"
+        "`بستن تیکت ST12345678`\n"
+        "• مشاهده تیکت:\n"
+        "`تیکت ST12345678`\n\n"
+        "📋 لیست اشتراک‌ها: `/subs`"
+    )
+    send_message(chat_id, text)
+
+
+def handle_admin_stats(chat_id, uid):
+    if uid != ADMIN_ID:
+        return
+    n = count_users()
+    active = 0
+    rows = db.execute("SELECT * FROM star_subs", fetch="all") or []
+    for r in rows:
+        try:
+            if datetime.fromisoformat(r["expires_at"].replace("Z", "")) > datetime.utcnow():
+                active += 1
+        except Exception:
+            pass
+    send_message(
+        chat_id,
+        f"📊 **آمار**\n\n👥 کل استارت‌ها: {n}\n✅ اشتراک فعال: {active}",
+    )
+
+
+# ─── تیکت و پشتیبانی ───
+def handle_support_menu(chat_id, uid):
+    st = get_state(uid)
+    st["step"] = "support_menu"
+    kb = {
+        "keyboard": [
+            [{"text": "💬 پشتیبانی در پیوی"}, {"text": "🤖 پشتیبانی از داخل بات"}],
+            [{"text": "🔙 بازگشت"}],
+        ],
+        "resize_keyboard": True,
+    }
+    send_message(chat_id, "🎫 **تیکت و پشتیبانی**\n\nیکی از گزینه‌ها را انتخاب کنید:", reply_markup=kb)
+
+
+def open_ticket_from_user(chat_id, user, text):
+    uid = user["id"]
+    tracking, tid = create_ticket(uid, text)
+    uname = f"@{user.get('username')}" if user.get("username") else "—"
+    name = user.get("first_name") or "—"
+    # به کاربر
+    send_message(
+        chat_id,
+        f"✅ تیکت شما ثبت شد.\n\n🔢 شماره پیگیری: `{tracking}`\n\nپاسخ ادمین همین‌جا اعلام می‌شود.",
+        reply_markup=main_kb(uid == ADMIN_ID),
+    )
+    clear_state(uid)
+    # به ادمین
+    admin_text = (
+        f"🎫 **تیکت جدید**\n\n"
+        f"🔢 پیگیری: `{tracking}`\n"
+        f"👤 نام: {name}\n"
+        f"🔗 یوزرنیم: {uname}\n"
+        f"🆔 آیدی: `{uid}`\n\n"
+        f"💬 پیام:\n{text}"
+    )
+    ikb = inline(
+        [
+            [
+                {"text": "💬 پاسخ", "callback_data": f"treply:{tracking}"},
+                {"text": "🗑 بستن تیکت", "callback_data": f"tclose:{tracking}"},
+            ]
+        ]
+    )
+    send_message(ADMIN_ID, admin_text, reply_markup=ikb)
+
+
+def admin_reply_ticket(tracking, admin_text):
+    t = get_ticket_by_tracking(tracking)
+    if not t or t["status"] != "open":
+        return False, "تیکت باز نیست."
+    add_ticket_msg(t["id"], True, admin_text)
+    uid = t["user_id"]
+    msg = (
+        f"💬 **پاسخ پشتیبانی** (پیگیری `{tracking}`)\n\n{admin_text}"
+    )
+    ikb = inline(
+        [
+            [
+                {"text": "💬 پاسخ", "callback_data": f"ureply:{tracking}"},
+                {"text": "🗑 بستن تیکت", "callback_data": f"uclose:{tracking}"},
+            ]
+        ]
+    )
+    send_message(uid, msg, reply_markup=ikb)
+    return True, "ok"
+
+
+# ─── ساخت پست ───
+def start_create_post(chat_id, uid):
+    st = get_state(uid)
+    st["step"] = "wait_content"
+    st["data"] = {"content": {}, "buttons": [], "current_row": []}
+    send_message(
+        chat_id,
+        "📝 **ساخت پست**\n\n"
+        "لطفاً مطلب خودتان را بفرستید.\n"
+        "متن تنها، عکس، فیلم یا فایل…\n\n"
+        "برای انصراف: 🔙 بازگشت",
+        reply_markup=back_kb(),
+    )
+
+
+def after_content(chat_id, uid):
+    st = get_state(uid)
+    st["step"] = "choose_btn_mode"
+    kb = {
+        "keyboard": [
+            [{"text": "⌨️ ساخت دکمه دستوری"}, {"text": "➕ با دکمه"}],
+            [{"text": "🔙 بازگشت"}],
+        ],
+        "resize_keyboard": True,
+    }
+    send_message(chat_id, "محتوا دریافت شد ✅\n\nنوع دکمه را انتخاب کنید:", reply_markup=kb)
 
 
 def parse_command_buttons(text):
+    """
+    هر خط یک ردیف
+    دکمه‌های یک ردیف با && جدا می‌شوند
+    فرمت هر دکمه: متن - لینک
+    """
     rows = []
     for line in text.strip().splitlines():
         line = line.strip()
         if not line:
             continue
+        parts = [p.strip() for p in line.split("&&")]
         row = []
-        for part in line.split("&&"):
-            part = part.strip()
-            if " - " in part:
-                name, url = part.split(" - ", 1)
-            elif "-" in part:
-                name, url = part.split("-", 1)
+        for p in parts:
+            if " - " in p:
+                t, u = p.split(" - ", 1)
+            elif "-" in p:
+                t, u = p.split("-", 1)
             else:
                 continue
-            name, url = name.strip(), url.strip()
-            if name and (url.startswith("http://") or url.startswith("https://")):
-                row.append({"text": name, "url": url})
+            t, u = t.strip(), u.strip()
+            if t and u:
+                row.append({"text": t, "url": u})
         if row:
             rows.append(row)
     return rows
 
 
-def parse_chat_ref(text):
-    text = (text or "").strip()
-    if text.startswith("https://ble.ir/") or text.startswith("http://ble.ir/"):
-        slug = text.split("ble.ir/", 1)[1].split("/", 1)[0].strip()
-        if slug:
-            return "@" + slug if not slug.startswith("@") and not slug.lstrip("-").isdigit() else slug
-    if text.startswith("@"):
-        return text
-    if re.fullmatch(r"-?\d+", text):
-        return int(text)
-    return None
-
-
-def member_status(chat_id, user_id):
-    res = api("getChatMember", chat_id=chat_id, user_id=user_id)
-    if not res.get("ok"):
-        return None
-    return res["result"].get("status")
-
-
-def is_admin_status(status):
-    return status in ("creator", "administrator")
-
-
-_bot_id = None
-
-
-def bot_id():
-    global _bot_id
-    if _bot_id is None:
-        me = api("getMe")
-        if not me.get("ok"):
-            return None
-        _bot_id = me["result"]["id"]
-    return _bot_id
-
-
-def resolve_chat(ref):
-    res = api("getChat", chat_id=ref)
-    if not res.get("ok"):
-        return None
-    chat = res["result"]
-    return {"id": chat["id"], "username": chat.get("username"), "title": chat.get("title") or chat.get("username")}
-
-
-def post_link(chat, message_id):
-    username = chat.get("username")
-    if username:
-        return f"https://ble.ir/{username}/{chat['id']}/{message_id}"
-    return f"شناسه پیام: {message_id}"
-
-
-def active_sub(user_id):
-    with connect() as conn:
-        row = conn.execute("SELECT * FROM subs WHERE user_id=?", (user_id,)).fetchone()
-    if not row or not row["active"] or not row["expires_at"]:
-        return None
-    expires = datetime.fromisoformat(row["expires_at"])
-    if expires <= utcnow():
-        with connect() as conn:
-            conn.execute("UPDATE subs SET active=0 WHERE user_id=?", (user_id,))
-        return None
-    return row
-
-
-def save_sub_channel(user_id, chat, signature, can_edit, plan=None, expires=None):
-    with connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO subs(user_id, plan, active, expires_at, channel_id, channel_username, signature, can_edit)
-            VALUES(?,?,?,?,?,?,?,?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                plan=COALESCE(excluded.plan, subs.plan),
-                active=COALESCE(excluded.active, subs.active),
-                expires_at=COALESCE(excluded.expires_at, subs.expires_at),
-                channel_id=excluded.channel_id,
-                channel_username=excluded.channel_username,
-                signature=COALESCE(excluded.signature, subs.signature),
-                can_edit=excluded.can_edit
-            """,
-            (
-                user_id,
-                plan,
-                1 if expires else None,
-                expires,
-                str(chat["id"]) if chat else None,
-                chat.get("username") if chat else None,
-                signature,
-                1 if can_edit else 0,
-            ),
-        )
-
-
-def go_main(chat_id, user_id, text="🏠 برگشتید به منوی اصلی."):
-    set_state(user_id, "idle", {})
-    send(chat_id, text, KB_MAIN)
-
-
-HELP = (
-    "✨ راهنمای ربات استار\n\n"
-    "📝 ساخت پست:\n"
-    "۱. مطلب را بفرستید (متن، عکس، فیلم یا فایل).\n"
-    "۲. ساخت دکمه دستوری: هر خط یک ردیف است. دکمه‌های یک ردیف را با && جدا کنید.\n"
-    "مثال:\n"
-    "کانال ما - https://ble.ir/mychannel && ربات ما - https://ble.ir/mybot\n"
-    "بله - https://ble.ir/bale\n"
-    "نتیجه:\n"
-    "دکمه | دکمه\n"
-    "دکمه\n\n"
-    "➕ با دکمه: زیر مطلب ➕ می‌آید. ➕ همان ردیف، دکمه را کنار قبلی می‌گذارد. "
-    "➕ ردیف پایین، ردیف تازه می‌سازد. در پایان «تمام» را بزنید.\n\n"
-    "بعد از تأیید، ربات را ادمین کانال کنید و آیدی کانال را بفرستید "
-    "(@username یا عدد).\n"
-    "📢 ارسال مستقیم همان لحظه در کانال منتشر می‌شود.\n"
-    "🔑 ارسال با دستور یک کد می‌دهد؛ هر کس در چتی که ربات عضو است "
-    "/start کد را بفرستد، همان پست ارسال می‌شود.\n\n"
-    "✍️ امضا زیر پیام: با اشتراک فعال، متن شما زیر پست‌های یک کانال چسبانده می‌شود. "
-    "فقط یک کانال قابل فعال‌سازی است.\n"
-    "⚠️ برای امضا، ربات باید ادمین کانال باشد و اجازهٔ ویرایش پیام داشته باشد."
-)
-
-
-def start_create(chat_id, user_id):
-    set_state(user_id, "waiting_content", {})
-    send(chat_id, "لطفاً مطلب خودتون رو بفرستید؛ متن، عکس، فیلم یا فایل.", KB_BACK)
-
-
-def after_content(chat_id, user_id, draft):
-    set_state(user_id, "choose_type", {"draft": draft, "buttons": []})
-    send(chat_id, "مطلب دریافت شد. نوع دکمه‌ها را انتخاب کنید.", KB_TYPE)
-
-
-def begin_command(chat_id, user_id):
-    state, data = get_state(user_id)
-    set_state(user_id, "waiting_command", data)
-    send(
+def ask_channel(chat_id, uid):
+    st = get_state(uid)
+    st["step"] = "wait_channel"
+    send_message(
         chat_id,
-        "دستور دکمه‌ها را بفرستید.\n"
-        "هر خط یک ردیف است و دکمه‌های یک ردیف با && جدا می‌شوند.\n\n"
-        "کانال ما - https://ble.ir/channel && ربات ما - https://ble.ir/bot\n"
-        "بله - https://ble.ir/bale",
-        KB_BACK,
+        "📢 **کانال مقصد**\n\n"
+        "آیدی کانال را بفرستید (با @ یا عددی).\n\n"
+        f"⚠️ اگر می‌خواهید در کانال از ربات استفاده کنید:\n"
+        f"بخش **مدیران** ← **افزودن مدیر** ← سرچ کنید `{BOT_USERNAME}` و ربات را اضافه کنید.\n\n"
+        "ربات و خودتان باید ادمین کانال باشید.",
+        reply_markup=back_kb(),
     )
 
 
-def begin_plus(chat_id, user_id):
-    state, data = get_state(user_id)
-    data["buttons"] = []
-    set_state(user_id, "plus", data)
-    send(chat_id, "برای افزودن دکمه روی ➕ بزنید. وقتی تمام شد «تمام» را بزنید.", KB_DONE)
-    show_post(chat_id, data["draft"], plus_keyboard([]))
-
-
-def refresh_plus(chat_id, user_id, data):
-    set_state(user_id, "plus", data)
-    show_post(chat_id, data["draft"], plus_keyboard(data.get("buttons") or []))
-    send(chat_id, "دکمه اضافه شد. ادامه دهید یا «تمام» را بزنید.", KB_DONE)
-
-
-def show_preview(chat_id, user_id, data):
-    set_state(user_id, "preview", data)
-    send(chat_id, "پیش‌نمایش:")
-    show_post(chat_id, data["draft"], url_keyboard(data.get("buttons") or []))
-    send(chat_id, "این پست درست است؟", kb_preview())
-
-
-def ask_channel(chat_id, user_id, data):
-    set_state(user_id, "waiting_channel", data)
-    send(
-        chat_id,
-        "ربات را در کانال یا گروه مورد نظر ادمین کنید و خودتان هم ادمین باشید.\n"
-        "سپس آیدی را بفرستید؛ هم @username و هم عدد قبول است.",
-        KB_BACK,
-    )
-
-
-def save_code_draft(user_id, data):
-    code = secrets.token_hex(4)
-    draft = data["draft"]
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO drafts(user_id, kind, payload, caption, buttons, code, created_at) VALUES(?,?,?,?,?,?,?)",
-            (
-                user_id,
-                draft["kind"],
-                draft["payload"],
-                draft.get("caption"),
-                json.dumps(data.get("buttons") or [], ensure_ascii=False),
-                code,
-                utcnow().isoformat(),
-            ),
-        )
-    return code
-
-
-def draft_by_code(code):
-    with connect() as conn:
-        row = conn.execute("SELECT * FROM drafts WHERE code=?", (code,)).fetchone()
-    if not row:
-        return None
-    return {
-        "kind": row["kind"],
-        "payload": row["payload"],
-        "caption": row["caption"],
-        "buttons": json.loads(row["buttons"] or "[]"),
-    }
-
-
-def publish_saved(chat_id, saved):
-    return deliver(chat_id, saved, saved["buttons"])
-
-
-def handle_start_code(chat_id, message_id, arg):
-    saved = draft_by_code(arg)
-    if not saved:
-        return False
-    api("deleteMessage", chat_id=chat_id, message_id=message_id)
-    publish_saved(chat_id, saved)
-    return True
-
-
-def verify_and_choose_method(chat_id, user_id, ref, data):
-    chat = resolve_chat(ref)
-    if not chat:
-        send(chat_id, "این آیدی پیدا نشد. ربات باید عضو و ادمین باشد. دوباره بفرستید.")
-        return
-    bid = bot_id()
-    if not bid or not is_admin_status(member_status(chat["id"], bid)):
-        send(chat_id, "ربات در این کانال یا گروه ادمین نیست. ادمین کنید و آیدی را دوباره بفرستید.")
-        return
-    if not is_admin_status(member_status(chat["id"], user_id)):
-        send(chat_id, "شما در این کانال یا گروه ادمین نیستید.")
-        return
-    data["target"] = chat
-    set_state(user_id, "choose_send", data)
-    send(chat_id, "دسترسی تأیید شد. روش ارسال را انتخاب کنید.", kb_send_method())
-
-
-def do_direct(chat_id, user_id, data):
-    target = data["target"]
-    result = deliver(target["id"], data["draft"], data.get("buttons") or [])
-    if not result.get("ok"):
-        send(chat_id, "ارسال نشد. دسترسی ارسال پیام ربات را بررسی کنید و دوباره تلاش کنید.", KB_MAIN)
-        set_state(user_id, "choose_send", data)
-        return
-    mid = result["result"]["message_id"]
-    send(chat_id, "پست در کانال ارسال شد.\n" + post_link(target, mid), KB_MAIN)
-    set_state(user_id, "idle", {})
-
-
-def do_command(chat_id, user_id, data):
-    code = save_code_draft(user_id, data)
-    send(
-        chat_id,
-        "کد پست ساخته شد. این دستور را در گروه یا کانالی که ربات در آن عضو است بفرستید:\n"
-        f"/start {code}\n\n"
-        "پیام دستور در صورت داشتن مجوز حذف می‌شود و خود پست ارسال می‌گردد.",
-        KB_MAIN,
-    )
-    set_state(user_id, "idle", {})
-
-
-def payment_text(user_id, plan_key):
-    plan = PLANS[plan_key]
-    return (
-        f"درخواست فعال‌سازی اشتراک {plan['title']}\n"
-        f"آیدی عددی: {user_id}\n"
-        f"مبلغ: {plan['amount']} تومان\n\n"
-        f"این پیام را برای @fazellrahimii فوروارد کنید و پاکت هدیه "
-        f"{plan['amount']} تومانی را هم ارسال کنید تا اشتراک فعال شود."
-    )
-
-
-def activate_plan(admin_chat, target_id, plan_key):
-    plan = PLANS[plan_key]
-    expires = (utcnow() + timedelta(days=plan["days"])).isoformat()
-    with connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO subs(user_id, plan, active, expires_at, can_edit)
-            VALUES(?,?,1,?,0)
-            ON CONFLICT(user_id) DO UPDATE SET
-                plan=excluded.plan, active=1, expires_at=excluded.expires_at
-            """,
-            (target_id, plan_key, expires),
-        )
-    send(admin_chat, f"اشتراک {plan['title']} برای {target_id} فعال شد.")
-    sent = send(
-        target_id,
-        f"اشتراک {plan['title']} برای شما فعال شد.\n"
-        "از منو «امضا زیر پیام» را بزنید، آیدی کانال، مجوز ویرایش و متن امضا را وارد کنید.",
-        KB_MAIN,
-    )
-    if not sent.get("ok"):
-        send(admin_chat, "به کاربر پیام نرسید؛ احتمالاً هنوز ربات را استارت نکرده است.")
-
-
-def begin_signature(chat_id, user_id):
-    sub = active_sub(user_id)
-    if not sub:
-        send(chat_id, "برای چسباندن خودکار امضا زیر پست کانال، یک اشتراک انتخاب کنید.", kb_plans())
-        return
-    extra = ""
-    if sub["channel_id"]:
-        extra = f"\nکانال فعلی: {sub['channel_username'] or sub['channel_id']}\nمتن: {sub['signature'] or '—'}"
-    send(chat_id, f"اشتراک {PLANS.get(sub['plan'], {}).get('title', sub['plan'])} فعال است.{extra}", kb_sig_manage())
-
-
-def ask_sig_channel(chat_id, user_id, data):
-    set_state(user_id, "sig_channel", data)
-    send(chat_id, "آیدی تنها کانالی که امضا باید در آن فعال شود را بفرستید. @ یا عدد.", KB_BACK)
-
-
-# جلوگیری از اعمال دوباره امضا روی همان پیام
-_SIG_DONE = set()
-
-
-def find_sig_sub(chat):
-    chat_id = str(chat.get("id") or "")
-    username = (chat.get("username") or "").lstrip("@").lower()
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM subs WHERE active=1 AND signature IS NOT NULL AND signature != ''"
-        ).fetchall()
-    for row in rows:
-        expires = datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None
-        if not expires or expires <= utcnow():
-            continue
-        stored = str(row["channel_id"] or "")
-        stored_user = (row["channel_username"] or "").lstrip("@").lower()
-        if stored and stored == chat_id:
-            return row
-        if username and stored_user and stored_user == username:
-            return row
-        # تطبیق عددی بدون علامت منفی
-        if stored and stored.lstrip("-") == chat_id.lstrip("-") and stored.lstrip("-").isdigit():
-            return row
-        # اگر کاربر @username ذخیره کرده ولی channel_id عدد است
-        if username and stored and stored.lstrip("@").lower() == username:
-            return row
-    return None
-
-
-def _sig_reply(cid, mid, signature):
-    """اگر ویرایش ممکن نبود، امضا را به‌صورت ریپلای زیر پست می‌فرستد."""
-    return api(
-        "sendMessage",
-        chat_id=cid,
-        text=signature,
-        reply_to_message_id=mid,
-    )
-
-
-def apply_signature(post):
-    """امضا را زیر پست کانال می‌چسباند.
-
-    در API بله/تلگرام ربات معمولاً نمی‌تواند پیام ادمین را ویرایش کند؛
-    پس اول edit را امتحان می‌کنیم و اگر نشد، با reply_to امضا را می‌فرستیم.
-    """
-    chat = post.get("chat") or {}
-    text = post.get("text")
-    caption = post.get("caption")
-    mid = post.get("message_id")
-    cid = chat.get("id")
-    if mid is None or cid is None:
-        return
-
-    key = f"{cid}:{mid}"
-    if key in _SIG_DONE:
-        return
-
-    # پیام خودِ ربات (امضای قبلی) را دوباره امضا نکن
-    from_user = post.get("from") or {}
-    if from_user.get("is_bot"):
-        return
-    # اگر خود متن قبلاً امضا بوده رد شو
-    signature_probe = (text or caption or "")
-    row = find_sig_sub(chat)
-    if not row:
-        log.info(
-            "signature skip: no matching sub for chat_id=%s username=%s",
-            chat.get("id"),
-            chat.get("username"),
-        )
-        return
-
-    signature = (row["signature"] or "").strip()
-    if not signature:
-        return
-    if signature in signature_probe:
-        return
-
-    edited = False
-    # تلاش برای ویرایش (فقط وقتی کاربر گفته مجوز ویرایش دارد)
-    if row["can_edit"]:
-        if text is not None:
-            new_text = (text.rstrip() + "\n\n" + signature).strip()
-            res = api("editMessageText", chat_id=cid, message_id=mid, text=new_text)
-            edited = bool(res.get("ok"))
-            if not edited:
-                log.warning("editMessageText failed chat=%s mid=%s: %s — fallback reply", cid, mid, res)
-        elif caption is not None or any(
-            k in post for k in ("photo", "video", "animation", "document", "audio")
-        ):
-            base = caption or ""
-            new_caption = (base.rstrip() + "\n\n" + signature).strip() if base else signature
-            res = api("editMessageCaption", chat_id=cid, message_id=mid, caption=new_caption)
-            edited = bool(res.get("ok"))
-            if not edited:
-                log.warning("editMessageCaption failed chat=%s mid=%s: %s — fallback reply", cid, mid, res)
-
-    if edited:
-        _SIG_DONE.add(key)
-        log.info("signature edited into post chat=%s mid=%s", cid, mid)
-        return
-
-    # روش مطمئن: ریپلای زیر پست
-    res = _sig_reply(cid, mid, signature)
-    if res.get("ok"):
-        _SIG_DONE.add(key)
-        log.info("signature replied under post chat=%s mid=%s", cid, mid)
-    else:
-        log.warning("signature reply failed chat=%s mid=%s: %s", cid, mid, res)
-
-    # جلوگیری از رشد بی‌نهایت حافظه
-    if len(_SIG_DONE) > 5000:
-        _SIG_DONE.clear()
-
-
-def on_text_flow(chat_id, user_id, text, message):
-    state, data = get_state(user_id)
-
-    if is_btn(text, "بازگشت"):
-        if state in ("waiting_btn_text", "waiting_btn_url"):
-            data.pop("temp_text", None)
-            data.pop("add_mode", None)
-            set_state(user_id, "plus", data)
-            send(chat_id, "افزودن دکمه لغو شد.", KB_DONE)
-            return
-        go_main(chat_id, user_id)
-        return
-
-    if is_btn(text, "ساخت پست"):
-        start_create(chat_id, user_id)
-        return
-    if is_btn(text, "راهنما"):
-        send(chat_id, HELP, KB_MAIN)
-        return
-    if is_btn(text, "امضا زیر پیام"):
-        begin_signature(chat_id, user_id)
-        return
-    if is_btn(text, "ساخت دکمه دستوری") and state == "choose_type":
-        begin_command(chat_id, user_id)
-        return
-    if is_btn(text, "با دکمه") and state == "choose_type":
-        begin_plus(chat_id, user_id)
-        return
-    if is_btn(text, "تمام") and state == "plus":
-        if not data.get("buttons"):
-            send(chat_id, "حداقل یک دکمه اضافه کنید یا بازگشت را بزنید.")
-            return
-        show_preview(chat_id, user_id, data)
-        return
-
-    if state == "waiting_content":
-        draft = extract_content(message)
-        if not draft:
-            send(chat_id, "این نوع پیام پشتیبانی نمی‌شود. متن، عکس، فیلم یا فایل بفرستید.")
-            return
-        after_content(chat_id, user_id, draft)
-        return
-
-    if state == "waiting_command":
-        buttons = parse_command_buttons(text)
-        if not buttons:
-            send(chat_id, "فرمت درست نیست. نمونه:\nکانال ما - https://ble.ir/a && ربات ما - https://ble.ir/b")
-            return
-        data["buttons"] = buttons
-        show_preview(chat_id, user_id, data)
-        return
-
-    if state == "waiting_btn_text":
-        data["temp_text"] = text.strip()
-        set_state(user_id, "waiting_btn_url", data)
-        send(chat_id, "لینک دکمه را بفرستید. باید با https:// شروع شود.", KB_BACK)
-        return
-
-    if state == "waiting_btn_url":
-        url = text.strip()
-        if not (url.startswith("http://") or url.startswith("https://")):
-            send(chat_id, "لینک نامعتبر است. دوباره بفرستید.")
-            return
-        btn = {"text": data.pop("temp_text"), "url": url}
-        mode = data.pop("add_mode", "new")
-        buttons = data.setdefault("buttons", [])
-        if mode == "same" and buttons:
-            buttons[-1].append(btn)
-        else:
-            buttons.append([btn])
-        refresh_plus(chat_id, user_id, data)
-        return
-
-    if state == "waiting_channel":
-        ref = parse_chat_ref(text)
-        if ref is None:
-            send(chat_id, "آیدی نامعتبر است. @username یا عدد بفرستید.")
-            return
-        verify_and_choose_method(chat_id, user_id, ref, data)
-        return
-
-    if state == "sig_channel":
-        ref = parse_chat_ref(text)
-        if ref is None:
-            send(chat_id, "آیدی نامعتبر است.")
-            return
-        chat = resolve_chat(ref)
-        if not chat:
-            send(chat_id, "کانال پیدا نشد. ربات باید عضو آن باشد.")
-            return
-        bid = bot_id()
-        if not bid or not is_admin_status(member_status(chat["id"], bid)):
-            send(chat_id, "ربات در این کانال ادمین نیست.")
-            return
-        if not is_admin_status(member_status(chat["id"], user_id)):
-            send(chat_id, "شما ادمین این کانال نیستید.")
-            return
-        data["sig_chat"] = chat
-        set_state(user_id, "sig_edit", data)
-        send(chat_id, "ربات اجازه ویرایش پیام‌های این کانال را دارد؟", KB_YESNO)
-        return
-
-    if state == "sig_edit":
-        if is_btn(text, "بله"):
-            data["can_edit"] = True
-        elif is_btn(text, "خیر"):
-            data["can_edit"] = False
-        else:
-            send(chat_id, "فقط «بله» یا «خیر» را بفرستید.", KB_YESNO)
-            return
-        set_state(user_id, "sig_text", data)
-        send(chat_id, "✍️ متن امضا را بفرستید. این متن زیر پست‌های کانال چسبانده می‌شود.", KB_BACK)
-        return
-
-    if state == "sig_text":
-        chat = data.get("sig_chat")
-        if not chat:
-            go_main(chat_id, user_id, "تنظیم امضا ناتمام ماند. از نو شروع کنید.")
-            return
-        with connect() as conn:
-            conn.execute(
-                "UPDATE subs SET channel_id=?, channel_username=?, signature=?, can_edit=? WHERE user_id=?",
-                (str(chat["id"]), chat.get("username"), text.strip(), 1 if data.get("can_edit") else 0, user_id),
-            )
-        log.info(
-            "signature configured user=%s channel_id=%s username=%s can_edit=%s",
-            user_id,
-            chat.get("id"),
-            chat.get("username"),
-            bool(data.get("can_edit")),
-        )
-        note = (
-            "\n✅ ربات زیر هر پست جدید کانال، امضا را می‌چسباند "
-            "(اگر ویرایش ممکن نباشد به‌صورت ریپلای می‌فرستد)."
-        )
-        go_main(
+def ask_send_method(chat_id, uid):
+    st = get_state(uid)
+    st["step"] = "choose_send"
+    # اگر امضا برای این کانال فعال است بپرس
+    data = st["data"]
+    ch = data.get("channel_id")
+    sub = get_sub(uid)
+    ask_sig = False
+    if sub and sub.get("signature_text") and sub.get("channel_id"):
+        if str(sub["channel_id"]) == str(ch) or str(sub["channel_id"]).lstrip("@") == str(ch).lstrip("@"):
+            ask_sig = True
+            st["data"]["sig_text"] = sub["signature_text"]
+    if ask_sig:
+        st["step"] = "ask_include_sig"
+        kb = {
+            "keyboard": [
+                [{"text": "✅ بله، امضا اضافه شود"}, {"text": "❌ نه، بدون امضا"}],
+                [{"text": "🔙 بازگشت"}],
+            ],
+            "resize_keyboard": True,
+        }
+        send_message(
             chat_id,
-            user_id,
-            f"✅ امضا فعال شد.\nکانال: {chat.get('username') or chat.get('id')}\n"
-            f"آیدی ذخیره‌شده: {chat.get('id')}" + note,
+            "✍️ برای این کانال **امضا** فعال است.\n"
+            f"متن امضا:\n{sub['signature_text']}\n\n"
+            "آیا موقع ارسال، امضا به انتهای مطلب اضافه شود؟",
+            reply_markup=kb,
         )
         return
+    kb = {
+        "keyboard": [
+            [{"text": "📤 ارسال مستقیم در کانال"}, {"text": "🔑 ارسال با دستور"}],
+            [{"text": "🔙 بازگشت"}],
+        ],
+        "resize_keyboard": True,
+    }
+    send_message(chat_id, "روش ارسال را انتخاب کنید:", reply_markup=kb)
 
-    if state == "sig_text_only":
-        with connect() as conn:
-            conn.execute("UPDATE subs SET signature=? WHERE user_id=?", (text.strip(), user_id))
-        go_main(chat_id, user_id, "✅ متن امضا به‌روز شد.")
-        return
 
-    if state == "idle":
-        send(chat_id, "👇 از دکمه‌های پایین استفاده کنید.", KB_MAIN)
-
-
-def on_callback(cq):
-    user_id = cq["from"]["id"]
-    chat_id = cq["message"]["chat"]["id"]
-    data_cb = cq.get("data") or ""
-    answer_cb(cq["id"])
-    state, data = get_state(user_id)
-
-    if data_cb in ("psame", "pnew") and state == "plus":
-        data["add_mode"] = "same" if data_cb == "psame" else "new"
-        set_state(user_id, "waiting_btn_text", data)
-        send(chat_id, "متن دکمه را بفرستید.", KB_BACK)
-        return
-    if data_cb == "pok" and state == "preview":
-        ask_channel(chat_id, user_id, data)
-        return
-    if data_cb == "pedit":
-        if data.get("draft"):
-            data["buttons"] = []
-            set_state(user_id, "choose_type", data)
-            send(chat_id, "نوع دکمه‌ها را دوباره انتخاب کنید.", KB_TYPE)
+def apply_signature_if_needed(data):
+    if data.get("include_sig") and data.get("sig_text"):
+        c = data.get("content") or {}
+        if c.get("text"):
+            c["text"] = c["text"].rstrip() + "\n\n" + data["sig_text"]
         else:
-            go_main(chat_id, user_id)
-        return
-    if data_cb == "sdir" and state == "choose_send":
-        do_direct(chat_id, user_id, data)
-        return
-    if data_cb == "scmd" and state == "choose_send":
-        do_command(chat_id, user_id, data)
-        return
-    if data_cb in ("sub1", "sub3", "suby"):
-        plan = {"sub1": "1m", "sub3": "3m", "suby": "1y"}[data_cb]
-        send(chat_id, payment_text(user_id, plan), KB_MAIN)
-        return
-    if data_cb == "esig":
-        if not active_sub(user_id):
-            send(chat_id, "اشتراک فعال ندارید.")
-            return
-        set_state(user_id, "sig_text_only", {})
-        send(chat_id, "متن جدید امضا را بفرستید.", KB_BACK)
-        return
-    if data_cb == "echan":
-        if not active_sub(user_id):
-            send(chat_id, "اشتراک فعال ندارید.")
-            return
-        ask_sig_channel(chat_id, user_id, {})
-        return
+            c["text"] = data["sig_text"]
+        data["content"] = c
 
 
-def on_message(message):
-    if "from" not in message or message.get("from", {}).get("is_bot"):
-        return
-    chat = message.get("chat") or {}
-    chat_id = chat["id"]
-    chat_type = chat.get("type") or ""
-    user_id = message["from"]["id"]
-    text = (message.get("text") or "").strip()
+def send_post_payload(chat_id, payload, as_preview=False):
+    content = payload.get("content") or {}
+    buttons = payload.get("buttons") or []
+    markup = build_inline_from_buttons(buttons)
+    ctype = content.get("type", "text")
+    caption = content.get("text") or content.get("caption") or ""
+    if ctype == "text" or not content.get("file_id"):
+        return send_message(chat_id, caption or "(بدون متن)", reply_markup=markup)
+    method = {
+        "photo": "sendPhoto",
+        "video": "sendVideo",
+        "document": "sendDocument",
+        "audio": "sendAudio",
+        "voice": "sendVoice",
+    }.get(ctype, "sendDocument")
+    body = {"chat_id": chat_id, ctype if ctype != "document" else "document": content["file_id"]}
+    # normalize
+    if ctype == "photo":
+        body = {"chat_id": chat_id, "photo": content["file_id"]}
+    elif ctype == "video":
+        body = {"chat_id": chat_id, "video": content["file_id"]}
+    elif ctype == "document":
+        body = {"chat_id": chat_id, "document": content["file_id"]}
+    else:
+        body = {"chat_id": chat_id, "document": content["file_id"]}
+    if caption:
+        body["caption"] = caption
+    if markup:
+        body["reply_markup"] = markup
+    return api(method if method != "sendDocument" or ctype == "document" else "sendDocument", **body)
 
-    if text.startswith("/start"):
-        parts = text.split(maxsplit=1)
-        arg = parts[1].split()[0] if len(parts) > 1 else ""
-        arg = arg.split("@", 1)[0]
-        if arg and handle_start_code(chat_id, message["message_id"], arg):
-            return
-        if chat_type and chat_type != "private":
-            return
-        go_main(chat_id, user_id, "🌟 سلام! به ربات استار خوش آمدید.\n👇 از دکمه‌های پایین استفاده کنید.")
-        return
 
-    if user_id == ADMIN_ID and text.startswith("برای "):
-        match = re.search(r"برای\s+(\d+)\s+اشتراک\s+(\S+)\s+فعال\s*کن", text)
-        if not match:
-            send(chat_id, "فرمت: برای 123456789 اشتراک 1m فعال کن")
-            return
-        plan = PLAN_ALIASES.get(match.group(2))
-        if not plan:
-            send(chat_id, "نوع اشتراک نامعتبر است. 1m یا 3m یا 1y")
-            return
-        activate_plan(chat_id, int(match.group(1)), plan)
-        return
+def extract_content_from_message(msg):
+    content = {"type": "text", "text": msg.get("text") or ""}
+    if msg.get("photo"):
+        content = {
+            "type": "photo",
+            "file_id": msg["photo"][-1]["file_id"],
+            "text": msg.get("caption") or "",
+        }
+    elif msg.get("video"):
+        content = {
+            "type": "video",
+            "file_id": msg["video"]["file_id"],
+            "text": msg.get("caption") or "",
+        }
+    elif msg.get("document"):
+        content = {
+            "type": "document",
+            "file_id": msg["document"]["file_id"],
+            "text": msg.get("caption") or "",
+        }
+    elif msg.get("audio"):
+        content = {
+            "type": "audio",
+            "file_id": msg["audio"]["file_id"],
+            "text": msg.get("caption") or "",
+        }
+    elif msg.get("voice"):
+        content = {
+            "type": "voice",
+            "file_id": msg["voice"]["file_id"],
+            "text": msg.get("caption") or "",
+        }
+    return content
 
-    if user_id == ADMIN_ID and text in ("/subs", "وضعیت اشتراک‌ها"):
-        with connect() as conn:
-            rows = conn.execute("SELECT * FROM subs ORDER BY user_id").fetchall()
+
+def do_direct_send(chat_id, uid):
+    st = get_state(uid)
+    data = st["data"]
+    apply_signature_if_needed(data)
+    channel = data["channel_id"]
+    payload = {"content": data["content"], "buttons": data.get("buttons") or []}
+    res = send_post_payload(channel, payload)
+    if not res.get("ok"):
+        send_message(
+            chat_id,
+            f"❌ ارسال ناموفق بود.\n{res.get('description', '')}\n"
+            f"مطمئن شوید ربات ادمین کانال است و `{BOT_USERNAME}` را اضافه کرده‌اید.",
+            reply_markup=main_kb(uid == ADMIN_ID),
+        )
+        clear_state(uid)
+        return
+    # لینک پیام
+    result = res.get("result") or {}
+    mid = result.get("message_id")
+    link = None
+    # تلاش برای ساخت لینک بله
+    ch_info = get_chat(channel)
+    uname = None
+    if ch_info.get("ok"):
+        uname = (ch_info.get("result") or {}).get("username")
+    if uname and mid:
+        link = f"https://ble.ir/{uname}/{mid}"
+    elif mid:
+        # عددی
+        cid = str(channel).replace("-100", "")
+        link = f"https://ble.ir/c/{cid}/{mid}"
+    msg = "✅ پست در کانال ارسال شد."
+    if link:
+        msg += f"\n\n🔗 لینک پیام:\n{link}"
+    send_message(chat_id, msg, reply_markup=main_kb(uid == ADMIN_ID))
+    clear_state(uid)
+
+
+def do_code_send(chat_id, uid):
+    st = get_state(uid)
+    data = st["data"]
+    apply_signature_if_needed(data)
+    code = secrets.token_hex(4)
+    payload = {"content": data["content"], "buttons": data.get("buttons") or []}
+    db.execute(
+        "INSERT INTO star_codes (code, owner_id, payload, created_at) VALUES (?,?,?,?)",
+        (code, uid, json.dumps(payload, ensure_ascii=False), datetime.utcnow().isoformat()),
+    )
+    send_message(
+        chat_id,
+        "✅ کد یکتا ساخته شد.\n\n"
+        f"این دستور را در گروه/کانالی که ربات عضو است بفرستید:\n\n"
+        f"`/start {code}`\n\n"
+        "اگر ربات مجوز حذف پیام داشته باشد، خود دستور پاک می‌شود.",
+        reply_markup=main_kb(uid == ADMIN_ID),
+    )
+    clear_state(uid)
+
+
+# ─── امضا ───
+def start_signature_flow(chat_id, uid):
+    if not is_sub_active(uid):
+        # فروش اشتراک
+        kb = {
+            "keyboard": [
+                [{"text": "۱ ماهه — ۷ هزار"}, {"text": "۳ ماهه — ۱۲ هزار"}],
+                [{"text": "۱ ساله — ۸۰ هزار"}],
+                [{"text": "🔙 بازگشت"}],
+            ],
+            "resize_keyboard": True,
+        }
+        st = get_state(uid)
+        st["step"] = "buy_plan"
+        send_message(
+            chat_id,
+            "✍️ **امضا زیر پیام**\n\n"
+            "این بخش نیاز به اشتراک دارد.\n"
+            "یکی از پلن‌ها را انتخاب کنید:",
+            reply_markup=kb,
+        )
+        return
+    sub = get_sub(uid)
+    if sub and sub.get("channel_id") and sub.get("signature_text"):
+        kb = {
+            "keyboard": [
+                [{"text": "✏️ ویرایش متن امضا"}, {"text": "📢 تغییر کانال"}],
+                [{"text": "🔙 بازگشت"}],
+            ],
+            "resize_keyboard": True,
+        }
+        send_message(
+            chat_id,
+            f"✍️ امضای شما فعال است.\n\n📢 کانال: {sub.get('channel_id')}\n"
+            f"متن:\n{sub.get('signature_text')}",
+            reply_markup=kb,
+        )
+        st = get_state(uid)
+        st["step"] = "sig_menu"
+        return
+    st = get_state(uid)
+    st["step"] = "sig_channel"
+    send_message(
+        chat_id,
+        "✍️ اشتراک شما فعال است.\n\n"
+        "آیدی کانالی که می‌خواهید امضا زیر پست‌هایش بیاید را بفرستید "
+        "(با @ یا عددی).\n\n"
+        f"ربات `{BOT_USERNAME}` باید ادمین کانال باشد.",
+        reply_markup=back_kb(),
+    )
+
+
+def plan_invoice(chat_id, user, plan_key, price):
+    uid = user["id"]
+    plan_name = {"1m": "یک‌ماهه", "3m": "سه‌ماهه", "1y": "یک‌ساله"}.get(plan_key, plan_key)
+    text = (
+        f"🛒 درخواست اشتراک **{plan_name}**\n\n"
+        f"🆔 آیدی عددی کاربر: `{uid}`\n"
+        f"مبلغ: **{price} هزار تومان**\n\n"
+        f"این پیام را برای {SUPPORT_USER} فوروارد کنید و "
+        f"پاکت هدیه {price} هزار تومنی را هم ارسال کنید تا فعال شود.\n\n"
+        f"دستور فعال‌سازی برای ادمین:\n"
+        f"`برای {uid} اشتراک {plan_key} فعال کن`"
+    )
+    send_message(chat_id, text, reply_markup=main_kb(uid == ADMIN_ID))
+    clear_state(uid)
+
+
+# ───────────────────────── پردازش پیام ─────────────────────────
+def process_admin_text_commands(chat_id, uid, text, msg):
+    if uid != ADMIN_ID:
+        return False
+    # فعال‌سازی
+    m = re.search(
+        r"برای\s+(\d+)\s+اشتراک\s+(1m|3m|1y)\s+فعال\s*کن",
+        text,
+        re.I,
+    )
+    if m:
+        target, plan = int(m.group(1)), m.group(2).lower()
+        exp = activate_sub(target, plan)
+        send_message(chat_id, f"✅ اشتراک {plan} برای `{target}` تا {to_jalali(datetime.fromisoformat(exp))} فعال شد.")
+        send_message(target, f"✅ اشتراک شما ({plan}) فعال شد.\nاز منوی «✍️ امضا زیر پیام» ادامه دهید.")
+        return True
+    # لغو
+    m = re.search(r"برای\s+(\d+)\s+اشتراک\s+لغو\s*کن", text, re.I)
+    if not m:
+        m = re.search(r"اشتراک\s+(\d+)\s+لغو", text, re.I)
+    if m:
+        target = int(m.group(1))
+        revoke_sub(target)
+        send_message(chat_id, f"❌ اشتراک `{target}` لغو شد.")
+        try:
+            send_message(target, "❌ اشتراک شما توسط ادمین لغو شد.")
+        except Exception:
+            pass
+        return True
+    # /subs
+    if text.strip() in ("/subs", "subs"):
+        rows = db.execute("SELECT * FROM star_subs", fetch="all") or []
         if not rows:
-            send(chat_id, "هیچ اشتراکی در دیتابیس نیست.")
-            return
+            send_message(chat_id, "هیچ اشتراکی نیست.")
+            return True
         lines = []
         for r in rows:
             lines.append(
-                f"user={r['user_id']} active={r['active']} plan={r['plan']}\n"
-                f"exp={r['expires_at']}\n"
-                f"ch={r['channel_id']} @{r['channel_username'] or '-'}\n"
-                f"can_edit={r['can_edit']} sig={(r['signature'] or '')[:40]}"
+                f"`{r['user_id']}` | {r.get('plan')} | تا {to_jalali(r.get('expires_at'))} | ch={r.get('channel_id')}"
             )
-        send(chat_id, "\n\n".join(lines)[:3500])
+        send_message(chat_id, "📋 اشتراک‌ها:\n\n" + "\n".join(lines[:50]))
+        return True
+    # بستن تیکت با دستور
+    m = re.search(r"بستن\s*تیکت\s*(ST\d+)", text, re.I)
+    if m:
+        tr = m.group(1).upper()
+        close_ticket(tr)
+        t = get_ticket_by_tracking(tr)
+        send_message(chat_id, f"✅ تیکت `{tr}` بسته شد.")
+        if t:
+            send_message(t["user_id"], f"🔒 تیکت `{tr}` توسط پشتیبانی بسته شد.")
+        return True
+    # مشاهده تیکت
+    m = re.search(r"تیکت\s+(ST\d+)", text, re.I)
+    if m:
+        tr = m.group(1).upper()
+        t = get_ticket_by_tracking(tr)
+        if not t:
+            send_message(chat_id, "تیکت پیدا نشد.")
+            return True
+        msgs = ticket_msgs(t["id"])
+        body = [
+            f"🎫 تیکت `{tr}` | status={t['status']} | user=`{t['user_id']}`"
+        ]
+        for x in msgs:
+            who = "ادمین" if x["from_admin"] else "کاربر"
+            body.append(f"• [{who}] {x['text']}")
+        send_message(chat_id, "\n".join(body)[:3500])
+        return True
+    # ریپلای روی پیام تیکت: «تیکت ببند»
+    if text.strip() in ("تیکت ببند", "بستن تیکت") and msg.get("reply_to_message"):
+        rt = msg["reply_to_message"].get("text") or ""
+        m = re.search(r"(ST\d+)", rt)
+        if m:
+            tr = m.group(1).upper()
+            close_ticket(tr)
+            t = get_ticket_by_tracking(tr)
+            send_message(chat_id, f"✅ تیکت `{tr}` بسته شد.")
+            if t:
+                send_message(t["user_id"], f"🔒 تیکت `{tr}` بسته شد.")
+            return True
+    return False
+
+
+def process_message(msg):
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    chat_type = chat.get("type", "")
+    user = msg.get("from") or {}
+    uid = user.get("id")
+    text = (msg.get("text") or "").strip()
+
+    if not uid or not chat_id:
         return
 
-    # منوی ربات فقط در چت خصوصی — در گروه/کانال اسپم نکند
-    if chat_type and chat_type != "private":
-        return
+    # فقط در خصوصی منوی کامل؛ در گروه فقط /start code
+    is_private = chat_type == "private"
 
-    if text or message.get("caption") or extract_content(message):
-        on_text_flow(chat_id, user_id, text, message)
-
-
-def handle_channel_content(post):
-    """پست کانال: کد /start یا امضا."""
-    text = (post.get("text") or "").strip()
+    # دستور کد در گروه/کانال
     if text.startswith("/start"):
-        parts = text.split(maxsplit=1)
-        arg = parts[1].split()[0] if len(parts) > 1 else ""
-        if arg and handle_start_code(post["chat"]["id"], post["message_id"], arg):
+        if is_private:
+            handle_start(chat_id, user, text)
+        else:
+            # فقط کد
+            parts = text.split(maxsplit=1)
+            if len(parts) == 2:
+                code = parts[1].strip()
+                row = db.execute(
+                    "SELECT * FROM star_codes WHERE code=?", (code,), fetch="one"
+                )
+                if row:
+                    try:
+                        payload = json.loads(row["payload"])
+                        send_post_payload(chat_id, payload)
+                        delete_message(chat_id, msg.get("message_id"))
+                    except Exception as e:
+                        log.warning("group code: %s", e)
+        return
+
+    if not is_private:
+        return
+
+    ensure_user(user)
+
+    # دستورات ادمین
+    if process_admin_text_commands(chat_id, uid, text, msg):
+        return
+
+    st = get_state(uid)
+    step = st.get("step")
+
+    # دکمه‌های ثابت منو
+    if text == "🔙 بازگشت" or text == "🔙 بازگشت به منو":
+        clear_state(uid)
+        send_message(chat_id, "منوی اصلی:", reply_markup=main_kb(uid == ADMIN_ID))
+        return
+
+    if text == "📝 ساخت پست":
+        start_create_post(chat_id, uid)
+        return
+    if text == "👤 حساب کاربری":
+        clear_state(uid)
+        handle_account(chat_id, user)
+        return
+    if text == "✍️ امضا زیر پیام":
+        start_signature_flow(chat_id, uid)
+        return
+    if text == "🎫 تیکت و پشتیبانی":
+        handle_support_menu(chat_id, uid)
+        return
+    if text == "🤖 ربات‌های دیگر ما":
+        clear_state(uid)
+        handle_other_bots(chat_id, uid)
+        return
+    if text == "📖 راهنما":
+        clear_state(uid)
+        handle_help(chat_id, uid)
+        return
+    if text == "🛠 پنل ادمین" and uid == ADMIN_ID:
+        handle_admin_panel(chat_id, uid)
+        return
+    if text == "📊 آمار کاربران" and uid == ADMIN_ID:
+        handle_admin_stats(chat_id, uid)
+        return
+    if text == "📘 راهنمای ادمین" and uid == ADMIN_ID:
+        handle_admin_guide(chat_id, uid)
+        return
+
+    # پشتیبانی
+    if text == "💬 پشتیبانی در پیوی":
+        send_message(
+            chat_id,
+            f"برای پشتیبانی مستقیم پیام دهید:\n{SUPPORT_USER}",
+            reply_markup=main_kb(uid == ADMIN_ID),
+        )
+        clear_state(uid)
+        return
+    if text == "🤖 پشتیبانی از داخل بات":
+        st["step"] = "wait_ticket"
+        send_message(
+            chat_id,
+            "لطفاً پیام خودتان را بفرستید.\nبعد از ارسال، شماره پیگیری دریافت می‌کنید.",
+            reply_markup=back_kb(),
+        )
+        return
+    if step == "wait_ticket" and text and text != "🔙 بازگشت":
+        open_ticket_from_user(chat_id, user, text)
+        return
+
+    # پاسخ کاربر به تیکت (حالت)
+    if step and step.startswith("user_reply_ticket:"):
+        tr = step.split(":", 1)[1]
+        t = get_ticket_by_tracking(tr)
+        if not t or t["status"] != "open":
+            send_message(chat_id, "این تیکت بسته است.", reply_markup=main_kb(uid == ADMIN_ID))
+            clear_state(uid)
             return
-    apply_signature(post)
+        add_ticket_msg(t["id"], False, text)
+        uname = f"@{user.get('username')}" if user.get("username") else "—"
+        admin_text = (
+            f"💬 ادامه تیکت `{tr}`\n"
+            f"از: {user.get('first_name')} | {uname} | `{uid}`\n\n{text}"
+        )
+        ikb = inline(
+            [
+                [
+                    {"text": "💬 پاسخ", "callback_data": f"treply:{tr}"},
+                    {"text": "🗑 بستن تیکت", "callback_data": f"tclose:{tr}"},
+                ]
+            ]
+        )
+        send_message(ADMIN_ID, admin_text, reply_markup=ikb)
+        send_message(chat_id, "✅ پیام شما ارسال شد.", reply_markup=main_kb(uid == ADMIN_ID))
+        clear_state(uid)
+        return
 
+    if step and step.startswith("admin_reply_ticket:"):
+        tr = step.split(":", 1)[1]
+        ok, _ = admin_reply_ticket(tr, text)
+        if ok:
+            send_message(chat_id, "✅ پاسخ ارسال شد.")
+        else:
+            send_message(chat_id, "تیکت باز نیست.")
+        clear_state(uid)
+        return
 
-def process(update):
-    try:
-        if "channel_post" in update:
-            handle_channel_content(update["channel_post"])
-        elif "message" in update:
-            msg = update["message"]
-            chat_type = (msg.get("chat") or {}).get("type") or ""
-            # بعضی سرورها پست کانال را به‌صورت message می‌فرستند
-            if chat_type == "channel":
-                handle_channel_content(msg)
-            else:
-                on_message(msg)
-        elif "callback_query" in update:
-            on_callback(update["callback_query"])
-        elif "edited_channel_post" in update:
+    # خرید پلن
+    if step == "buy_plan":
+        mapping = {
+            "۱ ماهه — ۷ هزار": ("1m", 7),
+            "۳ ماهه — ۱۲ هزار": ("3m", 12),
+            "۱ ساله — ۸۰ هزار": ("1y", 80),
+        }
+        if text in mapping:
+            plan_invoice(chat_id, user, mapping[text][0], mapping[text][1])
             return
-    except Exception:
-        log.exception("update failed")
+
+    # امضا
+    if step == "sig_channel" and text:
+        st["data"]["sig_channel"] = text.strip()
+        st["step"] = "sig_can_edit"
+        kb = {
+            "keyboard": [[{"text": "✅ بله"}, {"text": "❌ خیر"}], [{"text": "🔙 بازگشت"}]],
+            "resize_keyboard": True,
+        }
+        send_message(
+            chat_id,
+            "آیا ربات اجازه **ویرایش پیام** در کانال دارد؟\n"
+            "(اگر نه، امضا به‌صورت ریپلای زیر پست ارسال می‌شود)",
+            reply_markup=kb,
+        )
+        return
+    if step == "sig_can_edit":
+        if text in ("✅ بله", "❌ خیر"):
+            st["data"]["can_edit"] = 1 if text == "✅ بله" else 0
+            st["step"] = "sig_text"
+            send_message(chat_id, "متن امضا را بفرستید:", reply_markup=back_kb())
+        return
+    if step == "sig_text" and text:
+        ch = st["data"].get("sig_channel")
+        can_edit = st["data"].get("can_edit", 0)
+        sub = get_sub(uid)
+        if sub:
+            db.execute(
+                "UPDATE star_subs SET channel_id=?, signature_text=?, can_edit=? WHERE user_id=?",
+                (ch, text, can_edit, uid),
+            )
+        else:
+            db.execute(
+                "INSERT INTO star_subs (user_id, plan, expires_at, channel_id, signature_text, can_edit) VALUES (?,?,?,?,?,?)",
+                (uid, "manual", (datetime.utcnow() + timedelta(days=30)).isoformat(), ch, text, can_edit),
+            )
+        send_message(
+            chat_id,
+            f"✅ امضا ذخیره شد.\n📢 کانال: {ch}\n\nاز این به بعد زیر پست‌های این کانال اعمال می‌شود.",
+            reply_markup=main_kb(uid == ADMIN_ID),
+        )
+        clear_state(uid)
+        return
+    if step == "sig_menu":
+        if text == "✏️ ویرایش متن امضا":
+            st["step"] = "sig_text"
+            send_message(chat_id, "متن جدید امضا را بفرستید:", reply_markup=back_kb())
+            return
+        if text == "📢 تغییر کانال":
+            st["step"] = "sig_channel"
+            send_message(chat_id, "آیدی کانال جدید را بفرستید:", reply_markup=back_kb())
+            return
+
+    # ساخت پست — محتوا
+    if step == "wait_content":
+        content = extract_content_from_message(msg)
+        if not content.get("text") and not content.get("file_id"):
+            send_message(chat_id, "محتوای معتبر نفرستادید. دوباره تلاش کنید.")
+            return
+        st["data"]["content"] = content
+        after_content(chat_id, uid)
+        return
+
+    if step == "choose_btn_mode":
+        if text == "⌨️ ساخت دکمه دستوری":
+            st["step"] = "wait_cmd_buttons"
+            send_message(
+                chat_id,
+                "دکمه‌ها را با این فرمت بفرستید:\n\n"
+                "کانال ما - https://...\n"
+                "ربات ما - https://...\n\n"
+                "در یک ردیف چند دکمه: با && جدا کنید\n"
+                "مثال:\n"
+                "کانال - https://a.com && ربات - https://b.com\n"
+                "سایت - https://c.com",
+                reply_markup=back_kb(),
+            )
+            return
+        if text == "➕ با دکمه":
+            st["step"] = "plus_menu"
+            st["data"]["buttons"] = []
+            st["data"]["current_row"] = []
+            kb = {
+                "keyboard": [
+                    [{"text": "➕"}, {"text": "➕ ردیف پایین"}],
+                    [{"text": "✅ تمام"}],
+                    [{"text": "🔙 بازگشت"}],
+                ],
+                "resize_keyboard": True,
+            }
+            send_message(
+                chat_id,
+                "حالت ➕ فعال شد.\n"
+                "• ➕ → دکمه در همان ردیف\n"
+                "• ➕ ردیف پایین → ردیف جدید\n"
+                "• ✅ تمام → پایان",
+                reply_markup=kb,
+            )
+            return
+
+    if step == "wait_cmd_buttons" and text:
+        rows = parse_command_buttons(text)
+        if not rows:
+            send_message(chat_id, "فرمت نادرست است. دوباره بفرستید.")
+            return
+        st["data"]["buttons"] = rows
+        # پیش‌نمایش
+        st["step"] = "preview"
+        prev = format_preview(st["data"]["content"], rows)
+        kb = {
+            "keyboard": [
+                [{"text": "✅ درست است"}, {"text": "✏️ نیاز به اصلاح دارد"}],
+                [{"text": "🔙 بازگشت"}],
+            ],
+            "resize_keyboard": True,
+        }
+        send_message(chat_id, f"👁 **پیش‌نمایش**\n\n{prev}", reply_markup=kb)
+        send_post_payload(chat_id, {"content": st["data"]["content"], "buttons": rows})
+        return
+
+    if step == "plus_menu":
+        if text == "➕":
+            st["step"] = "plus_text"
+            st["data"]["_row_mode"] = "same"
+            send_message(chat_id, "متن دکمه را بفرستید:", reply_markup=back_kb())
+            return
+        if text == "➕ ردیف پایین":
+            st["step"] = "plus_text"
+            st["data"]["_row_mode"] = "new"
+            send_message(chat_id, "متن دکمه (ردیف جدید) را بفرستید:", reply_markup=back_kb())
+            return
+        if text == "✅ تمام":
+            # بستن ردیف جاری
+            if st["data"].get("current_row"):
+                st["data"].setdefault("buttons", []).append(st["data"]["current_row"])
+                st["data"]["current_row"] = []
+            st["step"] = "preview"
+            prev = format_preview(st["data"]["content"], st["data"].get("buttons") or [])
+            kb = {
+                "keyboard": [
+                    [{"text": "✅ درست است"}, {"text": "✏️ نیاز به اصلاح دارد"}],
+                    [{"text": "🔙 بازگشت"}],
+                ],
+                "resize_keyboard": True,
+            }
+            send_message(chat_id, f"👁 **پیش‌نمایش**\n\n{prev}", reply_markup=kb)
+            send_post_payload(
+                chat_id,
+                {"content": st["data"]["content"], "buttons": st["data"].get("buttons") or []},
+            )
+            return
+
+    if step == "plus_text" and text:
+        st["data"]["_btn_text"] = text
+        st["step"] = "plus_url"
+        send_message(chat_id, "لینک دکمه را بفرستید:", reply_markup=back_kb())
+        return
+    if step == "plus_url" and text:
+        btn = {"text": st["data"].get("_btn_text", "دکمه"), "url": text.strip()}
+        if st["data"].get("_row_mode") == "new":
+            if st["data"].get("current_row"):
+                st["data"].setdefault("buttons", []).append(st["data"]["current_row"])
+            st["data"]["current_row"] = [btn]
+        else:
+            st["data"].setdefault("current_row", []).append(btn)
+        st["step"] = "plus_menu"
+        kb = {
+            "keyboard": [
+                [{"text": "➕"}, {"text": "➕ ردیف پایین"}],
+                [{"text": "✅ تمام"}],
+                [{"text": "🔙 بازگشت"}],
+            ],
+            "resize_keyboard": True,
+        }
+        send_message(chat_id, "✅ دکمه اضافه شد.", reply_markup=kb)
+        return
+
+    if step == "preview":
+        if text == "✅ درست است":
+            ask_channel(chat_id, uid)
+            return
+        if text == "✏️ نیاز به اصلاح دارد":
+            start_create_post(chat_id, uid)
+            return
+
+    if step == "wait_channel" and text:
+        ch = text.strip()
+        # چک ادمین بودن ربات و کاربر
+        me = api("getMe")
+        bot_id = (me.get("result") or {}).get("id")
+        cm_bot = get_chat_member(ch, bot_id) if bot_id else {}
+        cm_user = get_chat_member(ch, uid)
+        def is_admin(cm):
+            stt = ((cm.get("result") or {}).get("status") or "")
+            return stt in ("administrator", "creator")
+        if not is_admin(cm_bot):
+            send_message(
+                chat_id,
+                f"❌ ربات در این کانال ادمین نیست.\n"
+                f"مدیران ← افزودن مدیر ← `{BOT_USERNAME}` را اضافه کنید.",
+            )
+            return
+        if not is_admin(cm_user):
+            send_message(chat_id, "❌ شما ادمین این کانال نیستید.")
+            return
+        st["data"]["channel_id"] = ch
+        ask_send_method(chat_id, uid)
+        return
+
+    if step == "ask_include_sig":
+        if text == "✅ بله، امضا اضافه شود":
+            st["data"]["include_sig"] = True
+        elif text == "❌ نه، بدون امضا":
+            st["data"]["include_sig"] = False
+        else:
+            return
+        st["step"] = "choose_send"
+        kb = {
+            "keyboard": [
+                [{"text": "📤 ارسال مستقیم در کانال"}, {"text": "🔑 ارسال با دستور"}],
+                [{"text": "🔙 بازگشت"}],
+            ],
+            "resize_keyboard": True,
+        }
+        send_message(chat_id, "روش ارسال را انتخاب کنید:", reply_markup=kb)
+        return
+
+    if step == "choose_send":
+        if text == "📤 ارسال مستقیم در کانال":
+            do_direct_send(chat_id, uid)
+            return
+        if text == "🔑 ارسال با دستور":
+            do_code_send(chat_id, uid)
+            return
+
+    # پیش‌فرض
+    if is_private and not step:
+        send_message(
+            chat_id,
+            "از دکمه‌های پایین استفاده کنید 👇",
+            reply_markup=main_kb(uid == ADMIN_ID),
+        )
 
 
-def flush_pending_updates():
-    """آپدیت‌های معوق را بدون پردازش رد می‌کند تا بعد از دیپلوی اسپم نشود."""
-    offset = 0
-    for _ in range(10):
-        res = api("getUpdates", offset=offset, timeout=0)
-        if not res.get("ok"):
-            break
-        batch = res.get("result") or []
-        if not batch:
-            break
-        offset = batch[-1]["update_id"] + 1
-    if offset:
-        meta_set("offset", offset)
-        log.info("skipped pending updates, offset=%s", offset)
-    return offset
+def process_callback(cq):
+    cq_id = cq.get("id")
+    data = cq.get("data") or ""
+    msg = cq.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    user = cq.get("from") or {}
+    uid = user.get("id")
+    answer_callback(cq_id)
+
+    if data.startswith("treply:") and uid == ADMIN_ID:
+        tr = data.split(":", 1)[1]
+        st = get_state(uid)
+        st["step"] = f"admin_reply_ticket:{tr}"
+        send_message(chat_id, f"پاسخ برای تیکت `{tr}` را بنویسید:")
+        return
+    if data.startswith("tclose:") and uid == ADMIN_ID:
+        tr = data.split(":", 1)[1]
+        close_ticket(tr)
+        t = get_ticket_by_tracking(tr)
+        send_message(chat_id, f"✅ تیکت `{tr}` بسته شد.")
+        if t:
+            send_message(t["user_id"], f"🔒 تیکت `{tr}` بسته شد.")
+        return
+    if data.startswith("ureply:"):
+        tr = data.split(":", 1)[1]
+        st = get_state(uid)
+        st["step"] = f"user_reply_ticket:{tr}"
+        send_message(chat_id, "پیام خود را برای پشتیبانی بنویسید:")
+        return
+    if data.startswith("uclose:"):
+        tr = data.split(":", 1)[1]
+        t = get_ticket_by_tracking(tr)
+        if t and t["user_id"] == uid:
+            close_ticket(tr)
+            send_message(chat_id, f"✅ تیکت `{tr}` بسته شد.")
+            send_message(ADMIN_ID, f"🔒 کاربر تیکت `{tr}` را بست.")
+        return
 
 
-def main():
-    init_db()
-    start_http()
-    api("deleteWebhook")
-    offset = flush_pending_updates() or int(meta_get("offset", "0") or 0)
-    log.info("star bot polling, db=%s", DB_PATH)
-    while True:
-        try:
-            res = api("getUpdates", offset=offset, timeout=30)
-            if not res.get("ok"):
-                time.sleep(3)
-                continue
-            for upd in res.get("result") or []:
-                offset = upd["update_id"] + 1
-                meta_set("offset", offset)
-                process(upd)
-        except Exception:
-            log.exception("poll loop")
-            time.sleep(5)
+def process_channel_post(msg):
+    """امضا زیر پست کانال"""
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    if not chat_id:
+        return
+    # پیدا کردن ساب‌هایی که این کانال را دارند
+    rows = db.execute("SELECT * FROM star_subs", fetch="all") or []
+    for sub in rows:
+        if not sub.get("signature_text") or not sub.get("channel_id"):
+            continue
+        if not is_sub_active(sub["user_id"]):
+            continue
+        ch = str(sub["channel_id"])
+        # تطبیق
+        ok = False
+        if str(chat_id) == ch or ch == str(chat.get("username") or ""):
+            ok = True
+        if ch.startswith("@") and chat.get("username") and ch[1:] == chat.get("username"):
+            ok = True
+        if not ok:
+            continue
+        sig = sub["signature_text"]
+        mid = msg.get("message_id")
+        # اول edit
+        base = msg.get("text") or msg.get("caption") or ""
+        if sub.get("can_edit") and base is not None:
+            new_text = (base.rstrip() + "\n\n" + sig) if base else sig
+            if msg.get("text"):
+                r = edit_message(chat_id, mid, new_text)
+                if r.get("ok"):
+                    log.info("signature edit ok chat=%s mid=%s", chat_id, mid)
+                    return
+        # ریپلای
+        send_message(chat_id, sig, reply_to=mid)
+        log.info("signature reply chat=%s mid=%s", chat_id, mid)
+        return
 
 
+# ───────────────────────── حلقه اصلی + HTTP ─────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"ok"
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(b"ok")
 
-    def log_message(self, fmt, *args):
-        return
+    def log_message(self, *args):
+        pass
 
 
 def start_http():
     port = int(os.environ.get("PORT", "10000"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
     log.info("http listening on 0.0.0.0:%s", port)
+    server.serve_forever()
+
+
+def main():
+    db.init()
+    api("deleteWebhook")
+    # رد کردن آپدیت‌های قدیمی
+    try:
+        r = requests.post(f"{API}/getUpdates", json={"offset": -1, "timeout": 0}, timeout=10)
+        data = r.json()
+        if data.get("ok") and data.get("result"):
+            last = data["result"][-1]["update_id"]
+            requests.post(f"{API}/getUpdates", json={"offset": last + 1}, timeout=10)
+    except Exception:
+        pass
+
+    t = threading.Thread(target=start_http, daemon=True)
+    t.start()
+
+    log.info("star bot polling, db=%s", "postgres" if _use_pg else DB_PATH)
+    offset = 0
+    while True:
+        try:
+            r = requests.post(
+                f"{API}/getUpdates",
+                json={"offset": offset, "timeout": 30},
+                timeout=35,
+            )
+            data = r.json()
+            if not data.get("ok"):
+                time.sleep(2)
+                continue
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                try:
+                    if "callback_query" in upd:
+                        process_callback(upd["callback_query"])
+                    elif "channel_post" in upd:
+                        process_channel_post(upd["channel_post"])
+                    elif "message" in upd:
+                        m = upd["message"]
+                        # گاهی پست کانال به صورت message می‌آید
+                        if (m.get("chat") or {}).get("type") == "channel":
+                            process_channel_post(m)
+                        else:
+                            process_message(m)
+                except Exception as e:
+                    log.exception("update error: %s", e)
+        except Exception as e:
+            log.warning("loop: %s", e)
+            time.sleep(3)
 
 
 if __name__ == "__main__":
